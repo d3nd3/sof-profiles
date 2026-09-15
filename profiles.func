@@ -46,10 +46,12 @@
 //        registry miss + invalid ..... onboarding mint offer (manual)
 //  4. Consumer hook _prof_userinfo_hook runs with the slot.
 //
-// Server-side aliases (console-callable via sp_sc_func_alias; console
-// calls drop function args, so admin input arrives via input cvars:
+// Server-side aliases (console-callable via sp_sc_func_alias; rcon/console-
+// typed calls get no function args on this build (only script-context calls
+// and sp_sc_exec_cvar forward args), so admin input arrives via input cvars:
 // set _prof_admin_nick <nickname>, _prof_admin_id <identity62>,
-// _prof_admin_slot <slot>, then call the zero-arg alias):
+// _prof_admin_slot <slot>, then call the zero-arg alias).
+// Rcon quoting: the rcon layer strips `"`, use `'..'` for grouping:
 //   prof_register ................ request (re)binding now.
 //   prof_find_by_id .............. sets _prof_found_slot (slot or -1).
 //   prof_find_by_name ............ exact nickname match -> _prof_found_slot.
@@ -198,7 +200,7 @@ function prof_sanitize(~text)
   sp_sc_cvar_sset _prof_skey #~plain
 }
 
-// Admin input arrives via cvars (console calls drop function args):
+// Admin input arrives via cvars (rcon/console-typed calls get no args):
 // set _prof_admin_nick <nickname>, set _prof_admin_id <identity62>,
 // set _prof_admin_slot <slot>, then call the zero-arg alias.
 function prof_admin_add()
@@ -462,8 +464,8 @@ function prof_userinfo_read(~slot)
     }
 
     // Dynamic dispatch: the hook function name comes from the consumer's
-    // _prof_userinfo_hook cvar (live-proven: sp_sc_exec_cvar drops the
-    // args here, dynamic func_exec carries them).
+    // _prof_userinfo_hook cvar. Script-context func_exec (including #cvar
+    // names) forwards args; only rcon/console-typed calls drop them.
     sp_sc_flow_if text val #_prof_userinfo_hook != val ""
     {
       sp_sc_func_exec #_prof_userinfo_hook #~slot
@@ -555,8 +557,8 @@ function prof_audit()
 }
 
 // Push the REGISTERED identity to one slot now (admin-ordered).
-// Console calls drop function args, so the slot arrives via the
-// _prof_admin_slot input cvar. Refuses unregistered nicknames and unknown
+// Rcon/console-typed calls get no function args, so the slot arrives via
+// the _prof_admin_slot input cvar. Refuses unregistered nicknames and unknown
 // teams (requests a snapshot instead) -- never invents bindings, never
 // flips teams blind.
 function prof_apply()

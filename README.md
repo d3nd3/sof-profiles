@@ -45,8 +45,13 @@ print another identity's key.
 
 ## Admin workflow
 
-Console calls drop function args, so admin input goes through input cvars
-first (`set` keeps full values, including 62-digit identities):
+Rcon/console-typed calls receive no function args on this build
+(verified 1.07fx86F: bare, `'..'`, and `".."` args all arrive empty, and
+`#cvar` is not expanded — only script-context calls, engine hooks, and
+`sp_sc_exec_cvar`/`sp_sc_exec_file` forward args), so admin input goes
+through input cvars first (`set` keeps full values, including 62-digit
+identities). Rcon quoting rules: the rcon layer strips `"` characters, so
+use `'..'` for grouping instead (`'` acts as `"` server-side):
 
 ```text
 python3 userinfo_rcon.py --mint        # secrets-minted 62-digit identity
