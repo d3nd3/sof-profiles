@@ -39,21 +39,25 @@
 //        registry miss + invalid ..... onboarding mint offer (manual)
 //  4. Consumer hook _prof_userinfo_hook runs with the slot.
 //
-// Server-side aliases (console-callable via sp_sc_func_alias):
-//   prof_register <slot> ......... request (re)binding now.
-//   prof_find_by_id <id> ......... sets _prof_found_slot (slot or -1).
-//   prof_find_by_name <name> ..... exact nickname match -> _prof_found_slot.
-//   prof_admin_add <nick> <id62> . register nickname (autosaves).
-//   prof_admin_del <nick> ........ unregister (autosaves).
+// Server-side aliases (console-callable via sp_sc_func_alias; console
+// calls drop function args, so admin input arrives via input cvars:
+// set _prof_admin_nick <nickname>, _prof_admin_id <identity62>,
+// _prof_admin_slot <slot>, then call the zero-arg alias):
+//   prof_register ................ request (re)binding now.
+//   prof_find_by_id .............. sets _prof_found_slot (slot or -1).
+//   prof_find_by_name ............ exact nickname match -> _prof_found_slot.
+//   prof_admin_add ............... register nickname (autosaves).
+//   prof_admin_del ............... unregister (autosaves).
 //   prof_admin_save / load ....... registry file write/read.
 //   prof_audit ................... report every non-spectator slot: ok /
 //                                  wrong (slot, name, current value) /
 //                                  guest / pending.
-//   prof_apply <slot> ............ push the REGISTERED identity now
+//   prof_apply ................... push the REGISTERED identity now
 //                                  (refuses unregistered nicknames).
 //   prof_enforce ................. prof_audit + push fixes for registered
 //                                  mismatches (never invents bindings).
-// Consumer opt-in: set _prof_userinfo_hook myfunc (+ function myfunc(~slot)).
+// Consumer hook: set _prof_userinfo_hook myfunc (dispatched with the slot
+// via dynamic func_exec).
 // Timing tune: set _prof_userinfo_delay <ms> (default 1000).
 // Recommended: set _sp_sv_limit_userinfo_change 1 (see README).
 // ---------------------------------------------------------------------------
@@ -121,27 +125,27 @@ function prof_request_snapshot(~slot)
   sp_sc_timer #_prof_userinfo_delay #~cmd
 }
 
-function prof_register(~slot)
+function prof_register()
 {
-  sp_sc_flow_if text val #~slot == val ""
+  sp_sc_flow_if text val #_prof_admin_slot == val ""
   {
-    echo "usage: prof_register <slot>"
+    echo "usage: set _prof_admin_slot <slot>, then prof_register"
   }
   else
   {
-    sp_sc_func_exec prof_request_snapshot #~slot
+    sp_sc_func_exec prof_request_snapshot #_prof_admin_slot
   }
 }
 
-function prof_find_by_id(~id)
+function prof_find_by_id()
 {
   set _prof_found_slot -1
-  sp_sc_flow_if text val #~id != val ""
+  sp_sc_flow_if text val #_prof_admin_id != val ""
   {
     set ~i 0
     sp_sc_flow_while number cvar ~i < cvar maxclients
     {
-      sp_sc_flow_if text cvar _prof_id_$~i == val #~id
+      sp_sc_flow_if text cvar _prof_id_$~i == val #_prof_admin_id
       {
         set _prof_found_slot #~i
       }
@@ -150,17 +154,26 @@ function prof_find_by_id(~id)
   }
 }
 
-function prof_find_by_name(~name)
+function prof_find_by_name()
 {
   set _prof_found_slot -1
-  sp_sc_flow_if text val #~name != val ""
+  sp_sc_flow_if text val #_prof_admin_nick != val ""
   {
+    // Sanitized compare: stored names carry color bytes the admin cannot
+    // type, so both sides go through the registry sanitize.
+    sp_sc_func_exec prof_sanitize #_prof_admin_nick
+    sp_sc_cvar_copy ~want _prof_skey
     set ~i 0
     sp_sc_flow_while number cvar ~i < cvar maxclients
     {
-      sp_sc_flow_if text cvar _prof_name_$~i == val #~name
+      sp_sc_cvar_copy ~cand _prof_name_$~i
+      sp_sc_flow_if text val #~cand != val ""
       {
-        set _prof_found_slot #~i
+        sp_sc_func_exec prof_sanitize #~cand
+        sp_sc_flow_if text cvar _prof_skey == val #~want
+        {
+          set _prof_found_slot #~i
+        }
       }
       add ~i 1
     }
@@ -171,33 +184,36 @@ function prof_find_by_name(~name)
 // kept -- same convention as spf_sv_rcon). Result in _prof_skey.
 function prof_sanitize(~text)
 {
-  sp_sc_cvar_no_color ~plain #~text
+  sp_sc_cvar_no_color ~plain ~text
   sp_sc_cvar_replace ~plain ~plain "%00-%2f:" "%3a-%60:" "%7b-%ff:"
   sp_sc_cvar_sset _prof_skey #~plain
 }
 
-function prof_admin_add(~nickname, ~identity)
+// Admin input arrives via cvars (console calls drop function args):
+// set _prof_admin_nick <nickname>, set _prof_admin_id <identity62>,
+// set _prof_admin_slot <slot>, then call the zero-arg alias.
+function prof_admin_add()
 {
-  sp_sc_flow_if text val #~nickname == val ""
+  sp_sc_flow_if text val #_prof_admin_nick == val ""
   {
-    echo "usage: prof_admin_add <nickname> <identity62> (mint: python3 userinfo_rcon.py --mint)"
+    echo "usage: set _prof_admin_nick <nickname>, set _prof_admin_id <identity62>, then prof_admin_add (mint: python3 userinfo_rcon.py --mint)"
   }
   else
   {
-    sp_sc_flow_if text val #~identity == val ""
+    sp_sc_flow_if text val #_prof_admin_id == val ""
     {
-      echo "usage: prof_admin_add <nickname> <identity62> (mint: python3 userinfo_rcon.py --mint)"
+      echo "usage: set _prof_admin_nick <nickname>, set _prof_admin_id <identity62>, then prof_admin_add (mint: python3 userinfo_rcon.py --mint)"
     }
     else
     {
-      sp_sc_cvar_len ~len ~identity
+      sp_sc_cvar_len ~len _prof_admin_id
       sp_sc_flow_if number cvar ~len != val 62
       {
         echo "prof_admin_add: identity must be 62 digits"
       }
       else
       {
-        sp_sc_cvar_copy ~digits ~identity
+        sp_sc_cvar_copy ~digits _prof_admin_id
         sp_sc_cvar_replace ~digits ~digits "%30:" "%31:" "%32:" "%33:" "%34:" "%35:" "%36:" "%37:" "%38:" "%39:"
         sp_sc_flow_if text cvar ~digits != val ""
         {
@@ -205,7 +221,7 @@ function prof_admin_add(~nickname, ~identity)
         }
         else
         {
-          sp_sc_func_exec prof_sanitize #~nickname
+          sp_sc_func_exec prof_sanitize #_prof_admin_nick
           sp_sc_flow_if text val #_prof_skey == val ""
           {
             echo "prof_admin_add: nickname sanitizes to empty"
@@ -213,10 +229,12 @@ function prof_admin_add(~nickname, ~identity)
           else
           {
             sp_sc_cvar_sset ~reg _prof_reg_ #_prof_skey
-            set #~reg #~identity
+            set #~reg #_prof_admin_id
             sp_sc_func_exec prof_admin_save
-            sset ~msg registry updated for #~nickname
+            sset ~msg registry updated for #_prof_admin_nick
             echo $~msg
+            zero _prof_admin_nick
+            zero _prof_admin_id
           }
         }
       }
@@ -224,15 +242,15 @@ function prof_admin_add(~nickname, ~identity)
   }
 }
 
-function prof_admin_del(~nickname)
+function prof_admin_del()
 {
-  sp_sc_flow_if text val #~nickname == val ""
+  sp_sc_flow_if text val #_prof_admin_nick == val ""
   {
-    echo "usage: prof_admin_del <nickname>"
+    echo "usage: set _prof_admin_nick <nickname>, then prof_admin_del"
   }
   else
   {
-    sp_sc_func_exec prof_sanitize #~nickname
+    sp_sc_func_exec prof_sanitize #_prof_admin_nick
     sp_sc_flow_if text val #_prof_skey == val ""
     {
       echo "prof_admin_del: nickname sanitizes to empty"
@@ -242,8 +260,9 @@ function prof_admin_del(~nickname)
       sp_sc_cvar_sset ~reg _prof_reg_ #_prof_skey
       set #~reg ""
       sp_sc_func_exec prof_admin_save
-      sset ~msg registry removed for #~nickname
+      sset ~msg registry removed for #_prof_admin_nick
       echo $~msg
+      zero _prof_admin_nick
     }
   }
 }
@@ -382,10 +401,12 @@ function prof_userinfo_read(~slot)
       }
     }
 
+    // Dynamic dispatch: the hook function name comes from the consumer's
+    // _prof_userinfo_hook cvar (live-proven: sp_sc_exec_cvar drops the
+    // args here, dynamic func_exec carries them).
     sp_sc_flow_if text val #_prof_userinfo_hook != val ""
     {
-      sp_sc_cvar_sset ~cb sp_sc_func_exec " " #_prof_userinfo_hook " " #~slot
-      sp_sc_exec_cvar ~cb
+      sp_sc_func_exec #_prof_userinfo_hook #~slot
     }
   }
   else
@@ -474,13 +495,16 @@ function prof_audit()
 }
 
 // Push the REGISTERED identity to one slot now (admin-ordered).
-// Refuses unregistered nicknames and unknown teams (requests a snapshot
-// instead) -- never invents bindings, never flips teams blind.
-function prof_apply(~slot)
+// Console calls drop function args, so the slot arrives via the
+// _prof_admin_slot input cvar. Refuses unregistered nicknames and unknown
+// teams (requests a snapshot instead) -- never invents bindings, never
+// flips teams blind.
+function prof_apply()
 {
+  sp_sc_cvar_copy ~slot _prof_admin_slot
   sp_sc_flow_if text val #~slot == val ""
   {
-    echo "usage: prof_apply <slot>"
+    echo "usage: set _prof_admin_slot <slot>, then prof_apply"
   }
   else
   {

@@ -45,13 +45,20 @@ print another identity's key.
 
 ## Admin workflow
 
+Console calls drop function args, so admin input goes through input cvars
+first (`set` keeps full values, including 62-digit identities):
+
 ```text
 python3 userinfo_rcon.py --mint        # secrets-minted 62-digit identity
-prof_admin_add <nickname> <identity>   # register (autosaves registry.cfg)
+set _prof_admin_nick <nickname>
+set _prof_admin_id <identity>
+prof_admin_add                         # register (autosaves registry.cfg)
 prof_audit                             # report: ok / wrong (slot, name, value) / guest / pending
-prof_apply <slot>                      # push the REGISTERED key now (refuses unknowns)
+set _prof_admin_slot <slot>
+prof_apply                             # push the REGISTERED key now (refuses unknowns)
 prof_enforce                           # audit + push fixes for registered mismatches
-prof_admin_del <nickname>              # unregister (autosaves)
+set _prof_admin_nick <nickname>
+prof_admin_del                         # unregister (autosaves)
 ```
 
 Nickname keys are sanitized (colors stripped, only `0-9a-z` kept, same
