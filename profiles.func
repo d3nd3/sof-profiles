@@ -103,6 +103,16 @@ function prof_userinfo_read_deferred()
 {
   sp_sc_cvar_copy ~slot _prof_read_slot
   sp_sc_func_exec prof_userinfo_read #~slot
+  sp_sc_func_exec prof_enforce_slot #~slot
+}
+
+function prof_enforce_slot(~slot)
+{
+  sp_sc_func_exec prof_audit_slot #~slot
+  sp_sc_flow_if text val #_prof_audit_rc == val wrong
+  {
+    sp_sc_func_exec prof_restore_stash_push #~slot
+  }
 }
 
 function prof_request_snapshot(~slot)
@@ -334,9 +344,15 @@ function prof_offer_key(~slot, ~full)
 function prof_offer_id(~slot, ~idpart)
 {
   sp_sc_cvar_copy ~team _prof_team
-  sp_sc_flow_if text val #~team != val 0
+  sp_sc_flow_if text val #~team == val 0
   {
-    sp_sc_flow_if text val #~team != val 1
+  }
+  else
+  {
+    sp_sc_flow_if text val #~team == val 1
+    {
+    }
+    else
     {
       set ~team 0
     }
@@ -359,12 +375,18 @@ function prof_notice_mismatch(~slot)
 // Push stash+current_team when live userinfo != stash+team (dedup on client value).
 function prof_restore_stash_push(~slot)
 {
-  sp_sc_cvar_copy ~team _prof_team_$~slot
-  sp_sc_flow_if text val #~team != val 0
+  sp_sc_cvar_copy ~team _prof_team
+  sp_sc_flow_if text val #~team == val 0
   {
-    sp_sc_flow_if text val #~team != val 1
+  }
+  else
+  {
+    sp_sc_flow_if text val #~team == val 1
     {
-      sp_sc_cvar_copy ~team _prof_team
+    }
+    else
+    {
+      sp_sc_cvar_copy ~team _prof_team_$~slot
     }
   }
   sp_sc_cvar_copy ~st _prof_stash_$~slot
@@ -622,9 +644,15 @@ function prof_apply()
         {
           sp_sc_cvar_copy _prof_push_id _prof_admin_id
           sp_sc_cvar_copy ~team _prof_team_$~slot
-          sp_sc_flow_if text val #~team != val 0
+          sp_sc_flow_if text val #~team == val 0
           {
-            sp_sc_flow_if text val #~team != val 1
+          }
+          else
+          {
+            sp_sc_flow_if text val #~team == val 1
+            {
+            }
+            else
             {
               sp_sc_cvar_copy ~team _prof_team
             }
@@ -662,13 +690,23 @@ function prof_push_slot(~slot)
 
 function prof_push_checked(~slot, ~team)
 {
-  sp_sc_flow_if text val #~team != val 0
+  set _prof_push_rc failed
+  sp_sc_flow_if text val #~team == val 0
   {
-    sp_sc_flow_if text val #~team != val 1
+    set _prof_team_$~slot #~team
+    sp_sc_func_exec prof_push_slot #~slot
+    sp_sc_flow_if text val #_prof_use_stufftext == val 1
     {
-      set _prof_push_rc failed
+      set _prof_push_rc pushed
     }
     else
+    {
+      set _prof_push_rc printed
+    }
+  }
+  else
+  {
+    sp_sc_flow_if text val #~team == val 1
     {
       set _prof_team_$~slot #~team
       sp_sc_func_exec prof_push_slot #~slot
@@ -680,19 +718,6 @@ function prof_push_checked(~slot, ~team)
       {
         set _prof_push_rc printed
       }
-    }
-  }
-  else
-  {
-    set _prof_team_$~slot #~team
-    sp_sc_func_exec prof_push_slot #~slot
-    sp_sc_flow_if text val #_prof_use_stufftext == val 1
-    {
-      set _prof_push_rc pushed
-    }
-    else
-    {
-      set _prof_push_rc printed
     }
   }
 }
