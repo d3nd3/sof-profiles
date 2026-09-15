@@ -10,64 +10,23 @@
 // bytes, leaving a guaranteed 434 for the rest (the engine rejects
 // over-budget sets, it never truncates).
 //
-// Authority model: the ADMIN identifies users. The server never invents
-// bindings -- it only enforces admin-registered nickname -> identity
-// mappings, on explicit admin order (prof_apply / prof_enforce). Player
-// notices never print another identity's key: mismatch notes are
-// generic; only the holder's own assigned key (or a fresh onboarding
-// mint) is ever unicast to a slot.
+// Authority model: the ADMIN registers identities and optional labels.
+// Client userinfo "name" is never read for matching. Recognition is
+// purely by the identity digits in team_red_blue. Admin labels are
+// metadata for humans and prof_find_by_name (registry index only).
 //
-// Slot-lifetime stash: the first valid identity a slot presents is kept
-// in _prof_stash_<slot> (cleared on disconnect). If the value later
-// collapses to a bare 0/1 (admin team change, menu team swap), the
-// stashed identity is restored with the CURRENT team digit via the
-// userinfo hook -- registry assignments always win over the stash.
-// _prof_restored_<slot> records the last restore to avoid re-pushing.
+// Registry (profiles/registry.cfg):
+//   _prof_reg_<62digit_id>  = admin label (may be empty)
+//   _prof_nick_<skey>       = id digits (label index; skey = prof_sanitize(label))
+// Mint: python3 userinfo_rcon.py --mint
 //
-// Registry: _prof_reg_<skey> cvars, where <skey> is the nickname run
-// through prof_sanitize (color-strip + delete outside 0-9a-z, same
-// convention as spf_sv_rcon). Persisted to sofplus/data/profiles/
-// registry.cfg (autosaved on add/del, loaded in profiles_init).
-// Mint fresh identities with: python3 userinfo_rcon.py --mint
+// Slot-lifetime stash: first valid identity a slot presents -> _prof_stash_<slot>.
+// Bare 0/1 (menu team swap, sp_sv_client_red/blue) -> restore stash+team
+// when stash is a registered identity (_prof_restored_<slot> dedupes).
 //
-// Flow:
-//  1. prof_client_begin / prof_userinfo_changed request a snapshot via
-//     ext_trigger_fire "userinfo" <slot> (needs ext_trigger.func).
-//  2. userinfo_rcon.py sends UDP `rcon dumpuser`, splits team_red_blue
-//     into _prof_id/_prof_team/_prof_id_valid (minting _prof_id_new) and
-//     writes sofplus/data/userinfo/snapshot_<slot>.cfg.
-//  3. prof_userinfo_read(~slot) execs the snapshot, then:
-//        registry hit + id match ... bind member triple
-//                                     (_prof_id_/_prof_team_/_prof_name_<slot>,
-//                                      _prof_member_<slot> = 1)
-//        registry hit + mismatch ..... member 0, generic notice (no key)
-//        registry hit, no usable key . unicast assigned key for manual apply
-//        registry miss + valid ....... guest latch (member 0), silent
-//        registry miss + invalid ..... onboarding mint offer (manual)
-//  4. Consumer hook _prof_userinfo_hook runs with the slot.
-//
-// Server-side aliases (console-callable via sp_sc_func_alias; rcon/console-
-// typed calls get no function args on this build (only script-context calls
-// and sp_sc_exec_cvar forward args), so admin input arrives via input cvars:
-// set _prof_admin_nick <nickname>, _prof_admin_id <identity62>,
-// _prof_admin_slot <slot>, then call the zero-arg alias).
-// Rcon quoting: the rcon layer strips `"`, use `'..'` for grouping:
-//   prof_register ................ request (re)binding now.
-//   prof_find_by_id .............. sets _prof_found_slot (slot or -1).
-//   prof_find_by_name ............ exact nickname match -> _prof_found_slot.
-//   prof_admin_add ............... register nickname (autosaves).
-//   prof_admin_del ............... unregister (autosaves).
-//   prof_admin_save / load ....... registry file write/read.
-//   prof_audit ................... report every non-spectator slot: ok /
-//                                  wrong (slot, name, current value) /
-//                                  guest / pending.
-//   prof_apply ................... push the REGISTERED identity now
-//                                  (refuses unregistered nicknames).
-//   prof_enforce ................. prof_audit + push fixes for registered
-//                                  mismatches (never invents bindings).
-// Consumer hook: set _prof_userinfo_hook myfunc (dispatched with the slot
-// via dynamic func_exec).
-// Timing tune: set _prof_userinfo_delay <ms> (default 1000).
+// Flow: ext_trigger -> userinfo_rcon -> snapshot_<slot>.cfg -> prof_userinfo_read.
+// Consumer hook: set _prof_userinfo_hook myfunc
+// Per-slot: _prof_id_<slot>, _prof_team_<slot>, _prof_label_<slot>, _prof_member_<slot>
 // Recommended: set _sp_sv_limit_userinfo_change 1 (see README).
 // ---------------------------------------------------------------------------
 
@@ -113,7 +72,7 @@ function prof_client_disconnect(~slot, *)
 {
   set _prof_id_$~slot ""
   set _prof_team_$~slot ""
-  set _prof_name_$~slot ""
+  set _prof_label_$~slot ""
   set _prof_member_$~slot ""
   set _prof_id_offered_$~slot ""
   set _prof_stash_$~slot ""
@@ -127,10 +86,7 @@ function prof_userinfo_changed(~slot)
 
 function prof_request_snapshot(~slot)
 {
-  // Export the change; the external helper returns data via snapshot file.
   sp_sc_func_exec ext_trigger_fire "userinfo" #~slot "" "" ""
-
-  // Snapshot arrives asynchronously (socket bus + UDP rcon); read it later.
   set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
   sset ~cmd sp_sc_func_exec prof_userinfo_read #~slot
   sp_sc_timer #_prof_userinfo_delay #~cmd
@@ -165,34 +121,23 @@ function prof_find_by_id()
   }
 }
 
+// Find a connected slot by admin registry label (not client userinfo name).
 function prof_find_by_name()
 {
   set _prof_found_slot -1
   sp_sc_flow_if text val #_prof_admin_nick != val ""
   {
-    // Sanitized compare: stored names carry color bytes the admin cannot
-    // type, so both sides go through the registry sanitize.
     sp_sc_func_exec prof_sanitize #_prof_admin_nick
-    sp_sc_cvar_copy ~want _prof_skey
-    set ~i 0
-    sp_sc_flow_while number cvar ~i < cvar maxclients
+    sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
+    sp_sc_flow_if text cvar ~idx != val ""
     {
-      sp_sc_cvar_copy ~cand _prof_name_$~i
-      sp_sc_flow_if text val #~cand != val ""
-      {
-        sp_sc_func_exec prof_sanitize #~cand
-        sp_sc_flow_if text cvar _prof_skey == val #~want
-        {
-          set _prof_found_slot #~i
-        }
-      }
-      add ~i 1
+      sp_sc_cvar_copy _prof_admin_id #~idx
+      sp_sc_func_exec prof_find_by_id
     }
   }
 }
 
-// Sanitize a nickname into a registry key (colors stripped, only 0-9a-z
-// kept -- same convention as spf_sv_rcon). Result in _prof_skey.
+// Admin-label index key (colors stripped, 0-9a-z). Result in _prof_skey.
 function prof_sanitize(~text)
 {
   sp_sc_cvar_no_color ~plain ~text
@@ -200,87 +145,126 @@ function prof_sanitize(~text)
   sp_sc_cvar_sset _prof_skey #~plain
 }
 
-// Admin input arrives via cvars (rcon/console-typed calls get no args):
-// set _prof_admin_nick <nickname>, set _prof_admin_id <identity62>,
-// set _prof_admin_slot <slot>, then call the zero-arg alias.
-function prof_admin_add()
+// Reads _prof_lookup_id; sets _prof_registered 1/0 and _prof_lookup_label.
+function prof_reg_lookup()
 {
-  sp_sc_flow_if text val #_prof_admin_nick == val ""
+  set _prof_registered 0
+  zero _prof_lookup_label
+  sp_sc_flow_if text val #_prof_lookup_id != val ""
   {
-    echo "usage: set _prof_admin_nick <nickname>, set _prof_admin_id <identity62>, then prof_admin_add (mint: python3 userinfo_rcon.py --mint)"
+    sp_sc_cvar_sset ~reg _prof_reg_ #_prof_lookup_id
+    sp_sc_flow_if text cvar ~reg != val ""
+    {
+      set _prof_registered 1
+      sp_sc_cvar_copy _prof_lookup_label #~reg
+    }
+  }
+}
+
+function prof_id_valid()
+{
+  sp_sc_cvar_len ~len _prof_admin_id
+  sp_sc_flow_if number cvar ~len != val 62
+  {
+    set _prof_id_check 0
   }
   else
   {
-    sp_sc_flow_if text val #_prof_admin_id == val ""
+    sp_sc_cvar_copy ~digits _prof_admin_id
+    sp_sc_cvar_replace ~digits ~digits "%30:" "%31:" "%32:" "%33:" "%34:" "%35:" "%36:" "%37:" "%38:" "%39:"
+    sp_sc_flow_if text cvar ~digits != val ""
     {
-      echo "usage: set _prof_admin_nick <nickname>, set _prof_admin_id <identity62>, then prof_admin_add (mint: python3 userinfo_rcon.py --mint)"
+      set _prof_id_check 0
     }
     else
     {
-      sp_sc_cvar_len ~len _prof_admin_id
-      sp_sc_flow_if number cvar ~len != val 62
+      set _prof_id_check 1
+    }
+  }
+}
+
+function prof_admin_add()
+{
+  sp_sc_flow_if text val #_prof_admin_id == val ""
+  {
+    echo "usage: set _prof_admin_id <identity62>, set _prof_admin_nick <label>, prof_admin_add"
+  }
+  else
+  {
+    sp_sc_func_exec prof_id_valid
+    sp_sc_flow_if text val #_prof_id_check != val 1
+    {
+      echo "prof_admin_add: identity must be 62 digits"
+    }
+    else
+    {
+      sp_sc_cvar_sset ~reg _prof_reg_ #_prof_admin_id
+      set #~reg #_prof_admin_nick
+      sp_sc_flow_if text val #_prof_admin_nick != val ""
       {
-        echo "prof_admin_add: identity must be 62 digits"
-      }
-      else
-      {
-        sp_sc_cvar_copy ~digits _prof_admin_id
-        sp_sc_cvar_replace ~digits ~digits "%30:" "%31:" "%32:" "%33:" "%34:" "%35:" "%36:" "%37:" "%38:" "%39:"
-        sp_sc_flow_if text cvar ~digits != val ""
+        sp_sc_func_exec prof_sanitize #_prof_admin_nick
+        sp_sc_flow_if text val #_prof_skey != val ""
         {
-          echo "prof_admin_add: identity must be digits only"
-        }
-        else
-        {
-          sp_sc_func_exec prof_sanitize #_prof_admin_nick
-          sp_sc_flow_if text val #_prof_skey == val ""
-          {
-            echo "prof_admin_add: nickname sanitizes to empty"
-          }
-          else
-          {
-            sp_sc_cvar_sset ~reg _prof_reg_ #_prof_skey
-            set #~reg #_prof_admin_id
-            sp_sc_func_exec prof_admin_save
-            sset ~msg registry updated for #_prof_admin_nick
-            echo $~msg
-            zero _prof_admin_nick
-            zero _prof_admin_id
-          }
+          sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
+          set #~idx #_prof_admin_id
         }
       }
+      sp_sc_func_exec prof_admin_save
+      sset ~msg registry id #_prof_admin_id label #_prof_admin_nick
+      echo $~msg
+      zero _prof_admin_nick
+      zero _prof_admin_id
     }
   }
 }
 
 function prof_admin_del()
 {
-  sp_sc_flow_if text val #_prof_admin_nick == val ""
+  sp_sc_flow_if text val #_prof_admin_id == val ""
   {
-    echo "usage: set _prof_admin_nick <nickname>, then prof_admin_del"
-  }
-  else
-  {
-    sp_sc_func_exec prof_sanitize #_prof_admin_nick
-    sp_sc_flow_if text val #_prof_skey == val ""
+    sp_sc_flow_if text val #_prof_admin_nick == val ""
     {
-      echo "prof_admin_del: nickname sanitizes to empty"
+      echo "usage: set _prof_admin_id <identity62> or _prof_admin_nick <label>, prof_admin_del"
     }
     else
     {
-      sp_sc_cvar_sset ~reg _prof_reg_ #_prof_skey
-      set #~reg ""
-      sp_sc_func_exec prof_admin_save
-      sset ~msg registry removed for #_prof_admin_nick
-      echo $~msg
-      zero _prof_admin_nick
+      sp_sc_func_exec prof_sanitize #_prof_admin_nick
+      sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
+      sp_sc_cvar_copy ~id #~idx
+      sp_sc_flow_if text val #~id == val ""
+      {
+        echo "prof_admin_del: label not in registry"
+      }
+      else
+      {
+        set _prof_admin_id #~id
+        zero _prof_admin_nick
+        sp_sc_func_exec prof_admin_del
+      }
     }
+  }
+  else
+  {
+    sp_sc_cvar_sset ~reg _prof_reg_ #_prof_admin_id
+    sp_sc_cvar_copy ~lbl #~reg
+    set #~reg ""
+    sp_sc_flow_if text val #~lbl != val ""
+    {
+      sp_sc_func_exec prof_sanitize #~lbl
+      sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
+      set #~idx ""
+    }
+    sp_sc_func_exec prof_admin_save
+    sset ~msg registry removed id #_prof_admin_id
+    echo $~msg
+    zero _prof_admin_nick
+    zero _prof_admin_id
   }
 }
 
 function prof_admin_save()
 {
-  sp_sc_cvar_save profiles/registry.cfg _prof_reg_*
+  sp_sc_cvar_save profiles/registry.cfg _prof_reg_* _prof_nick_*
 }
 
 function prof_admin_load()
@@ -292,8 +276,6 @@ function prof_admin_load()
   }
 }
 
-// Live client info for ~slot. Globals _prof_ps_present/_prof_ps_name/_prof_ps_spec
-// (not ~ temps) so callers see the result after sp_sc_func_exec.
 function prof_slot_info(~slot)
 {
   set _prof_ps_present 0
@@ -302,13 +284,10 @@ function prof_slot_info(~slot)
   sp_sc_flow_if text cvar _sp_sv_info_client_ip != val ""
   {
     set _prof_ps_present 1
-    sp_sc_cvar_copy _prof_ps_name _sp_sv_info_client_name
     sp_sc_cvar_copy _prof_ps_spec _sp_sv_info_client_spectator
   }
 }
 
-// Print a key for manual `set team_red_blue <full> u` (once per slot).
-// ~full must already hold the complete value (identity + team digit).
 function prof_offer_key(~slot, ~full)
 {
   sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
@@ -320,8 +299,6 @@ function prof_offer_key(~slot, ~full)
   }
 }
 
-// Offer an identity part with the fresh team digit (defaults blue when the
-// snapshot carries no usable team, so no "-1" suffix can ever be offered).
 function prof_offer_id(~slot, ~idpart)
 {
   sp_sc_cvar_copy ~team _prof_team
@@ -336,7 +313,6 @@ function prof_offer_id(~slot, ~idpart)
   sp_sc_func_exec prof_offer_key #~slot #~full
 }
 
-// Generic mismatch notice (never carries a key).
 function prof_notice_mismatch(~slot)
 {
   sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
@@ -345,6 +321,63 @@ function prof_notice_mismatch(~slot)
     sp_sc_cvar_unescape ~msg ~msg
     sp_sv_print_client #~slot #~msg
     set _prof_id_offered_$~slot 1
+  }
+}
+
+// Stufftext or offer stash+team once per value.
+function prof_restore_stash(~slot)
+{
+  sp_sc_cvar_copy ~team _prof_team
+  sp_sc_flow_if text val #~team != val 0
+  {
+    sp_sc_flow_if text val #~team != val 1
+    {
+      zero ~team
+    }
+  }
+  sp_sc_cvar_copy ~st _prof_stash_$~slot
+  sp_sc_flow_if text val #~st == val ""
+  {
+    sp_sc_flow_if text val #~team == val ""
+    {
+      sp_sc_flow_if text val #_prof_id_new != val ""
+      {
+        sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
+      }
+    }
+  }
+  else
+  {
+    sp_sc_cvar_sset ~full #~st #~team
+    sp_sc_cvar_copy ~rec _prof_restored_$~slot
+    sp_sc_flow_if text cvar ~rec != val #~full
+    {
+      sp_sc_flow_if text val #_prof_use_stufftext == val 1
+      {
+        stufftext #~slot set team_red_blue #~full u
+        set _prof_restored_$~slot #~full
+      }
+      else
+      {
+        sp_sc_func_exec prof_offer_key #~slot #~full
+      }
+    }
+  }
+}
+
+function prof_bind_slot(~slot)
+{
+  sp_sc_cvar_copy _prof_lookup_id _prof_id
+  sp_sc_func_exec prof_reg_lookup
+  sp_sc_flow_if text val #_prof_registered == val 1
+  {
+    sp_sc_cvar_copy _prof_id_$~slot _prof_id
+    set _prof_team_$~slot #_prof_team
+    sp_sc_cvar_copy _prof_label_$~slot _prof_lookup_label
+    set _prof_member_$~slot 1
+    set _prof_id_offered_$~slot 0
+    sp_sc_cvar_copy _prof_stash_$~slot _prof_id
+    set _prof_restored_$~slot none
   }
 }
 
@@ -358,47 +391,25 @@ function prof_userinfo_read(~slot)
     sp_sc_exec_file #~exec
     set _prof_userinfo_tries_$~slot 0
 
-    // team_red_blue already split by the helper into
-    // _prof_id/_prof_team/_prof_id_valid (+_prof_id_new when unregistered).
-    // Registry key for this nickname (shared sanitize both sides).
-    sp_sc_func_exec prof_sanitize #_prof_userinfo_name
-    sp_sc_cvar_copy ~skey _prof_skey
     sp_sc_flow_if text val #_prof_id_valid == val 1
     {
-      sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
+      sp_sc_cvar_copy _prof_lookup_id _prof_id
+      sp_sc_func_exec prof_reg_lookup
+      sp_sc_flow_if text val #_prof_registered == val 1
       {
-        sp_sc_flow_if text cvar _prof_reg_$~skey == val #_prof_id
-        {
-          // Registered + match: bind member triple, sync stash.
-          set _prof_id_$~slot #_prof_id
-          set _prof_team_$~slot #_prof_team
-          set _prof_name_$~slot #_prof_userinfo_name
-          set _prof_member_$~slot 1
-          set _prof_id_offered_$~slot 0
-          set _prof_stash_$~slot #_prof_id
-          set _prof_restored_$~slot none
-        }
-        else
-        {
-          // Registered but wrong key: no bind, generic notice (no key).
-          set _prof_member_$~slot 0
-          set _prof_restored_$~slot none
-          sp_sc_func_exec prof_notice_mismatch #~slot
-        }
+        sp_sc_func_exec prof_bind_slot #~slot
       }
       else
       {
-        // Guest: latch for lookup, never bound as member. Stash the
-        // first valid identity seen for the slot lifetime.
-        set _prof_id_$~slot #_prof_id
+        sp_sc_cvar_copy _prof_id_$~slot _prof_id
         set _prof_team_$~slot #_prof_team
-        set _prof_name_$~slot #_prof_userinfo_name
+        set _prof_label_$~slot ""
         set _prof_member_$~slot 0
         set _prof_restored_$~slot none
         sp_sc_cvar_copy ~st _prof_stash_$~slot
         sp_sc_flow_if text val #~st == val ""
         {
-          set _prof_stash_$~slot #_prof_id
+          sp_sc_cvar_copy _prof_stash_$~slot _prof_id
         }
       }
     }
@@ -406,67 +417,9 @@ function prof_userinfo_read(~slot)
     {
       set _prof_member_$~slot 0
       set _prof_id_$~slot ""
-      sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
-      {
-        // Registered but no usable key on the client: offer the assigned
-        // one for manual apply (never pushed without an admin order).
-        sp_sc_cvar_copy ~exp _prof_reg_$~skey
-        sp_sc_func_exec prof_offer_id #~slot #~exp
-      }
-      else
-      {
-        // Unknown nickname: restore the stashed identity with the current
-        // team when possible, else onboarding mint offer.
-        sp_sc_cvar_copy ~team _prof_team
-        sp_sc_flow_if text val #~team != val 0
-        {
-          sp_sc_flow_if text val #~team != val 1
-          {
-            zero ~team
-          }
-        }
-        sp_sc_cvar_copy ~st _prof_stash_$~slot
-        sp_sc_flow_if text val #~team == val ""
-        {
-          sp_sc_flow_if text val #_prof_id_new != val ""
-          {
-            sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
-          }
-        }
-        else
-        {
-          sp_sc_flow_if text val #~st == val ""
-          {
-            sp_sc_flow_if text val #_prof_id_new != val ""
-            {
-              sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
-            }
-          }
-          else
-          {
-            // Restore once per value (recorded; re-armed by valid reads).
-            sp_sc_cvar_sset ~full #~st #~team
-            sp_sc_cvar_copy ~rec _prof_restored_$~slot
-            sp_sc_flow_if text cvar ~rec != val #~full
-            {
-              sp_sc_flow_if text val #_prof_use_stufftext == val 1
-              {
-                stufftext #~slot set team_red_blue #~full u
-                set _prof_restored_$~slot #~full
-              }
-              else
-              {
-                sp_sc_func_exec prof_offer_key #~slot #~full
-              }
-            }
-          }
-        }
-      }
+      sp_sc_func_exec prof_restore_stash #~slot
     }
 
-    // Dynamic dispatch: the hook function name comes from the consumer's
-    // _prof_userinfo_hook cvar. Script-context func_exec (including #cvar
-    // names) forwards args; only rcon/console-typed calls drop them.
     sp_sc_flow_if text val #_prof_userinfo_hook != val ""
     {
       sp_sc_func_exec #_prof_userinfo_hook #~slot
@@ -489,8 +442,47 @@ function prof_userinfo_read(~slot)
   }
 }
 
-// Report every connected non-spectator slot: ok / wrong (with the value
-// they carry) / guest / pending (snapshot requested to converge).
+function prof_audit_slot(~slot)
+{
+  set _prof_audit_rc guest
+  sp_sc_cvar_sset ~snap userinfo/snapshot_ $~slot .cfg
+  sp_sc_file_find ~f sofplus/data/$~snap filesystem file
+  sp_sc_flow_if number cvar ~f_0 == val 1
+  {
+    sp_sc_cvar_sset ~exec sofplus/data/ #~snap
+    sp_sc_exec_file #~exec
+    sp_sc_flow_if text val #_prof_id_valid == val 1
+    {
+      sp_sc_cvar_copy _prof_lookup_id _prof_id
+      sp_sc_func_exec prof_reg_lookup
+      sp_sc_flow_if text val #_prof_registered == val 1
+      {
+        set _prof_audit_rc ok
+      }
+      else
+      {
+        set _prof_audit_rc guest
+      }
+    }
+    else
+    {
+      sp_sc_cvar_copy _prof_lookup_id _prof_stash_$~slot
+      sp_sc_flow_if text val #_prof_lookup_id != val ""
+      {
+        sp_sc_func_exec prof_reg_lookup
+        sp_sc_flow_if text val #_prof_registered == val 1
+        {
+          set _prof_audit_rc wrong
+        }
+      }
+    }
+  }
+  else
+  {
+    set _prof_audit_rc pending
+  }
+}
+
 function prof_audit()
 {
   set ~nok 0
@@ -505,49 +497,37 @@ function prof_audit()
     {
       sp_sc_flow_if text cvar _prof_ps_spec == val 0
       {
-        sp_sc_func_exec prof_sanitize #_prof_ps_name
-        sp_sc_cvar_copy ~skey _prof_skey
-        sp_sc_cvar_sset ~snap userinfo/snapshot_ $~i .cfg
-        sp_sc_file_find ~f sofplus/data/$~snap filesystem file
-        sp_sc_flow_if number cvar ~f_0 == val 1
+        sp_sc_func_exec prof_audit_slot #~i
+        sp_sc_flow_if text val #_prof_audit_rc == val ok
         {
-          sp_sc_cvar_sset ~exec sofplus/data/ #~snap
-          sp_sc_exec_file #~exec
-          sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
-          {
-            sp_sc_flow_if text val #_prof_id_valid == val 1
-            {
-              sp_sc_flow_if text cvar _prof_reg_$~skey == val #_prof_id
-              {
-                add ~nok 1
-              }
-              else
-              {
-                sset ~msg slot #~i #_prof_ps_name wrong: #_prof_userinfo_team_red_blue
-                echo $~msg
-                add ~nbad 1
-              }
-            }
-            else
-            {
-              sset ~msg slot #~i #_prof_ps_name wrong: #_prof_userinfo_team_red_blue
-              echo $~msg
-              add ~nbad 1
-            }
-          }
-          else
-          {
-            sset ~msg slot #~i #_prof_ps_name guest: #_prof_userinfo_team_red_blue
-            echo $~msg
-            add ~nguest 1
-          }
+          sset ~msg slot #~i ok id #_prof_id label #_prof_lookup_label
+          echo $~msg
+          add ~nok 1
         }
         else
         {
-          sset ~msg slot #~i #_prof_ps_name pending: no snapshot yet, requesting
-          echo $~msg
-          sp_sc_func_exec prof_request_snapshot #~i
-          add ~npending 1
+          sp_sc_flow_if text val #_prof_audit_rc == val wrong
+          {
+            sset ~msg slot #~i wrong: #_prof_userinfo_team_red_blue stash #_prof_stash_$~i
+            echo $~msg
+            add ~nbad 1
+          }
+          else
+          {
+            sp_sc_flow_if text val #_prof_audit_rc == val guest
+            {
+              sset ~msg slot #~i guest: #_prof_userinfo_team_red_blue
+              echo $~msg
+              add ~nguest 1
+            }
+            else
+            {
+              sset ~msg slot #~i pending: no snapshot, requesting
+              echo $~msg
+              sp_sc_func_exec prof_request_snapshot #~i
+              add ~npending 1
+            }
+          }
         }
       }
     }
@@ -557,59 +537,63 @@ function prof_audit()
   echo $~msg
 }
 
-// Push the REGISTERED identity to one slot now (admin-ordered).
-// Rcon/console-typed calls get no function args, so the slot arrives via
-// the _prof_admin_slot input cvar. Refuses unregistered nicknames and unknown
-// teams (requests a snapshot instead) -- never invents bindings, never
-// flips teams blind.
 function prof_apply()
 {
   sp_sc_cvar_copy ~slot _prof_admin_slot
+  sp_sc_cvar_copy ~id _prof_admin_id
   sp_sc_flow_if text val #~slot == val ""
   {
-    echo "usage: set _prof_admin_slot <slot>, then prof_apply"
+    echo "usage: set _prof_admin_slot <slot>, set _prof_admin_id <identity62>, prof_apply"
   }
   else
   {
-    sp_sc_func_exec prof_slot_info #~slot
-    sp_sc_flow_if number cvar _prof_ps_present != val 1
+    sp_sc_flow_if text val #~id == val ""
     {
-      echo "prof_apply: slot empty"
+      echo "usage: set _prof_admin_slot <slot>, set _prof_admin_id <identity62>, prof_apply"
     }
     else
     {
-      sp_sc_func_exec prof_sanitize #_prof_ps_name
-      sp_sc_cvar_copy ~skey _prof_skey
-      sp_sc_flow_if text cvar _prof_reg_$~skey == val ""
+      sp_sc_func_exec prof_slot_info #~slot
+      sp_sc_flow_if number cvar _prof_ps_present != val 1
       {
-        sset ~msg prof_apply: nickname not registered, use prof_admin_add first
-        echo $~msg
+        echo "prof_apply: slot empty"
       }
       else
       {
-        // Latch only: the fresh _prof_team global may belong to another
-        // slot here (no snapshot was just read), so unknown means abort.
-        sp_sc_cvar_copy ~team _prof_team_$~slot
-        sp_sc_func_exec prof_push_checked #~slot #~team
-        sp_sc_flow_if text val #_prof_push_rc == val failed
+        sp_sc_cvar_copy _prof_lookup_id _prof_admin_id
+        sp_sc_func_exec prof_reg_lookup
+        sp_sc_flow_if text val #_prof_registered != val 1
         {
-          echo "prof_apply: no team data yet, requesting snapshot"
-          sp_sc_func_exec prof_request_snapshot #~slot
+          echo "prof_apply: identity not registered, use prof_admin_add first"
+        }
+        else
+        {
+          sp_sc_cvar_copy _prof_push_id _prof_admin_id
+          sp_sc_cvar_copy ~team _prof_team_$~slot
+          sp_sc_flow_if text val #~team != val 0
+          {
+            sp_sc_flow_if text val #~team != val 1
+            {
+              sp_sc_cvar_copy ~team _prof_team
+            }
+          }
+          sp_sc_func_exec prof_push_checked #~slot #~team
+          sp_sc_flow_if text val #_prof_push_rc == val failed
+          {
+            echo "prof_apply: no team data yet, requesting snapshot"
+            sp_sc_func_exec prof_request_snapshot #~slot
+          }
         }
       }
     }
   }
 }
 
-// Push _prof_reg_ for ~slot with the latched team (stufftext, or echo the
-// exact command when disabled). Caller verified registration + team:
-// _prof_skey holds the registry key and _prof_team_<slot> is 0/1.
 function prof_push_slot(~slot)
 {
-  sp_sc_cvar_copy ~skey _prof_skey
   sp_sc_cvar_copy ~team _prof_team_$~slot
-  sp_sc_cvar_copy ~exp _prof_reg_$~skey
-  sp_sc_cvar_sset ~full #~exp #~team
+  sp_sc_cvar_sset ~full #_prof_push_id #~team
+  sp_sc_cvar_copy _prof_stash_$~slot _prof_push_id
   sp_sc_flow_if text val #_prof_use_stufftext == val 1
   {
     stufftext #~slot set team_red_blue #~full u
@@ -623,10 +607,6 @@ function prof_push_slot(~slot)
   }
 }
 
-// Checked push of the registry identity in _prof_skey for ~slot with the
-// EXPLICIT team digit in ~team (callers resolve it; no globals are read
-// here, so a stale _prof_team from another slot can never leak in).
-// Sets _prof_push_rc to pushed / printed / failed. Never pushes blind.
 function prof_push_checked(~slot, ~team)
 {
   sp_sc_flow_if text val #~team != val 0
@@ -664,9 +644,6 @@ function prof_push_checked(~slot, ~team)
   }
 }
 
-// Batch version of prof_apply over every connected non-spectator slot:
-// registered mismatches get their assigned key pushed now; guests and
-// unknowns are only reported. Never invents bindings.
 function prof_enforce()
 {
   set ~nok 0
@@ -682,84 +659,47 @@ function prof_enforce()
     {
       sp_sc_flow_if text cvar _prof_ps_spec == val 0
       {
-        sp_sc_func_exec prof_sanitize #_prof_ps_name
-        sp_sc_cvar_copy ~skey _prof_skey
-        sp_sc_cvar_sset ~snap userinfo/snapshot_ $~i .cfg
-        sp_sc_file_find ~f sofplus/data/$~snap filesystem file
-        sp_sc_flow_if number cvar ~f_0 == val 1
+        sp_sc_func_exec prof_audit_slot #~i
+        sp_sc_flow_if text val #_prof_audit_rc == val ok
         {
-          sp_sc_cvar_sset ~exec sofplus/data/ #~snap
-          sp_sc_exec_file #~exec
-          sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
+          set _prof_member_$~i 1
+          add ~nok 1
+        }
+        else
+        {
+          sp_sc_flow_if text val #_prof_audit_rc == val wrong
           {
-            sp_sc_flow_if text val #_prof_id_valid == val 1
+            sp_sc_cvar_copy _prof_push_id _prof_stash_$~i
+            sp_sc_func_exec prof_push_checked #~i #_prof_team
+            sp_sc_flow_if text val #_prof_push_rc == val pushed
             {
-              sp_sc_flow_if text cvar _prof_reg_$~skey == val #_prof_id
-              {
-                set _prof_member_$~i 1
-                add ~nok 1
-              }
-              else
-              {
-                // Fresh team: this slot's snapshot was just exec'd above.
-                sp_sc_func_exec prof_push_checked #~i #_prof_team
-                sp_sc_flow_if text val #_prof_push_rc == val pushed
-                {
-                  add ~nfix 1
-                }
-                else
-                {
-                  sp_sc_flow_if text val #_prof_push_rc == val printed
-                  {
-                    add ~nmanual 1
-                  }
-                  else
-                  {
-                    sset ~msg slot #~i #_prof_ps_name no team data, requesting snapshot
-                    echo $~msg
-                    sp_sc_func_exec prof_request_snapshot #~i
-                    add ~npending 1
-                  }
-                }
-              }
+              add ~nfix 1
             }
             else
             {
-              // Fresh team: this slot's snapshot was just exec'd above.
-              sp_sc_func_exec prof_push_checked #~i #_prof_team
-              sp_sc_flow_if text val #_prof_push_rc == val pushed
+              sp_sc_flow_if text val #_prof_push_rc == val printed
               {
-                add ~nfix 1
+                add ~nmanual 1
               }
               else
               {
-                sp_sc_flow_if text val #_prof_push_rc == val printed
-                {
-                  add ~nmanual 1
-                }
-                else
-                {
-                  sset ~msg slot #~i #_prof_ps_name no team data, requesting snapshot
-                  echo $~msg
-                  sp_sc_func_exec prof_request_snapshot #~i
-                  add ~npending 1
-                }
+                sp_sc_func_exec prof_request_snapshot #~i
+                add ~npending 1
               }
             }
           }
           else
           {
-            sset ~msg slot #~i #_prof_ps_name guest: #_prof_userinfo_team_red_blue
-            echo $~msg
-            add ~nguest 1
+            sp_sc_flow_if text val #_prof_audit_rc == val guest
+            {
+              add ~nguest 1
+            }
+            else
+            {
+              sp_sc_func_exec prof_request_snapshot #~i
+              add ~npending 1
+            }
           }
-        }
-        else
-        {
-          sset ~msg slot #~i #_prof_ps_name pending: no snapshot yet, requesting
-          echo $~msg
-          sp_sc_func_exec prof_request_snapshot #~i
-          add ~npending 1
         }
       }
     }

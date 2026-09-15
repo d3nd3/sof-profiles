@@ -7,102 +7,72 @@ Admin-assigned player identity for SoF1 servers, carried in `team_red_blue`.
 `team_red_blue` holds `<62 random digits><team 0/1>`. The game reads it
 with `atoi` and uses the smallest bit (0 = blue, 1 = red); parity survives
 `atoi` overflow, so the last char stays the team bit and the leading digits
-are the player identity (~206 bits). Budget, worst case not typical case:
-keys/values cap at 63 usable chars, so a maxed `team_red_blue` costs
-13 + 63 + 2 = 78 of the 512 info-string bytes, leaving a guaranteed 434
-for everything else (the engine rejects over-budget sets instead of
-truncating, so overflow is impossible). With the default 14-key block
-(146 bytes fixed overhead) the other values share ~303 bytes; shortening
-the token would free only ~30 bytes there, so the full 62 digits stay.
+are the player identity (~206 bits).
 
-The admin owns the nickname -> identity registry. The server never invents
-bindings and never pushes without an admin order; player-side notices never
-print another identity's key.
+The admin registers **identities** and optional **labels** (human nicknames
+the admin chooses). Client userinfo `name` is never used for matching — a
+player may have an empty name. Recognition is purely by the identity digits
+presented in `team_red_blue`.
 
 ## Layout
 
 - `profiles.func`: in-game side (hooks, registry, audit/apply/enforce).
-  Drop into `sofplus/addons/` next to `ext_trigger.func`.
-- `ext_trigger.func`: generic trigger transport (canonical source, also here).
-- `userinfo_rcon.py`: external side. Subscribes to `userinfo` trigger events
-  on the sof-export-fire socket bus, sends UDP `rcon dumpuser <slot>`,
-  parses the reply, and writes `sofplus/data/userinfo/snapshot_<slot>.cfg`
-  for the script to exec back. Stdlib only.
+- `ext_trigger.func`: generic trigger transport.
+- `userinfo_rcon.py`: external snapshot bridge (UDP `rcon dumpuser`).
 
 ## Setup
 
-1. Copy `profiles.func` and `ext_trigger.func` to
-   `user-<PORT>/sofplus/addons/` (or `base/sofplus/addons/`). Requires the
-   buddy `stufftext` mod for server-pushed keys; without it everything
-   degrades to printed `set ... u` instructions.
-2. Symlink `user-<PORT>` → `User` in the SoF root (export-fire extracts the
-   game port from that path; ext_trigger writes under `User/sofplus/data/`).
-   Run one sof-export-fire watcher per server instance — point `--root` at
-   the `user-<PORT>` directory, not the full game tree (recursive inotify on
-   the install root is unreliable on Linux):
+1. Copy `profiles.func` and `ext_trigger.func` to `sofplus/addons/`.
+   Requires buddy `stufftext` mod for server-pushed keys.
+2. Symlink `user-<PORT>` → `User` in the SoF root. Run export-fire with
+   `--root <SoF root>/user-<PORT>` (not the full game tree):
    `python sof_export_fire.py --root <SoF root>/user-<PORT> --serve 127.0.0.1:8765`.
-3. Run `userinfo_rcon.py` with `RCON_PASSWORD` set (server
-   `rcon_password`). Optional env: `EXPORT_FIRE_HOST/PORT`, `RCON_HOST`,
-   `RCON_PORT` (0 = game port from the event), `RCON_TIMEOUT/QUIET`,
-   `EXTRA_USERINFO_KEYS`, `VERBOSE=1`.
-4. Set `_sp_sv_limit_userinfo_change 1` on the server (see below).
-5. For remote rcon `sp_sc_func_exec` calls, create the swap alias once per
-   server process:
+3. Run `userinfo_rcon.py` with `RCON_PASSWORD` set.
+4. Set `_sp_sv_limit_userinfo_change 1` on the server.
+5. For remote rcon `sp_sc_func_exec`:
    `sp_sc_alias swap 'sp_sv_client_swap #{1}'`
+
+## Registry
+
+Stored in `sofplus/data/profiles/registry.cfg`:
+
+- `_prof_reg_<62digit_id>` = admin label (may be empty)
+- `_prof_nick_<skey>` = id digits (label index; `skey` = sanitized label)
 
 ## Admin workflow
 
-Rcon/console-typed calls receive no function args on this build
-(verified 1.07fx86F: bare, `'..'`, and `".."` args all arrive empty, and
-`#cvar` is not expanded — only script-context calls, engine hooks, and
-`sp_sc_exec_cvar`/`sp_sc_exec_file` forward args), so admin input goes
-through input cvars first (`set` keeps full values, including 62-digit
-identities). Rcon quoting rules: the rcon layer strips `"` characters, so
-use `'..'` for grouping instead (`'` acts as `"` server-side):
-
 ```text
-python3 userinfo_rcon.py --mint        # secrets-minted 62-digit identity
-set _prof_admin_nick <nickname>
+python3 userinfo_rcon.py --mint        # mint 62-digit identity
 set _prof_admin_id <identity>
-prof_admin_add                         # register (autosaves registry.cfg)
-prof_audit                             # report: ok / wrong (slot, name, value) / guest / pending
+set _prof_admin_nick <label>          # optional admin label
+prof_admin_add                         # register (autosaves)
+prof_audit                             # ok / wrong / guest / pending per slot
 set _prof_admin_slot <slot>
-prof_apply                             # push the REGISTERED key now (refuses unknowns)
-prof_enforce                           # audit + push fixes for registered mismatches
-set _prof_admin_nick <nickname>
-prof_admin_del                         # unregister (autosaves)
+set _prof_admin_id <identity>
+prof_apply                             # push registered identity to slot
+prof_enforce                           # fix registered stash collapses (bare 0/1)
+set _prof_admin_id <identity>          # or set _prof_admin_nick <label>
+prof_admin_del
 ```
 
-Nickname keys are sanitized (colors stripped, only `0-9a-z` kept, same
-convention as `spf_sv_rcon`): `Bob` registers as `ob`, all-caps names are
-rejected. Per-slot state for other addons: `_prof_id_<slot>`,
-`_prof_team_<slot>`, `_prof_name_<slot>`, `_prof_member_<slot>` (1 only for
-registry-verified bindings). Lookups: `prof_find_by_id`,
-`prof_find_by_name` (-> `_prof_found_slot`). Hook: `set
-_prof_userinfo_hook myfunc`.
+## Per-slot state (for other addons)
 
-Slot-lifetime stash: the first valid identity a slot presents is kept in
-`_prof_stash_<slot>` (cleared on disconnect). If the value later collapses
-to a bare `0`/`1` — admin team change or menu team swap — the stashed
-identity is restored with the *current* team digit through the userinfo
-hook (once per value, tracked in `_prof_restored_<slot>`). Registry
-assignments always win over the stash.
+- `_prof_id_<slot>` — identity digits latched from userinfo
+- `_prof_team_<slot>` — team bit 0/1
+- `_prof_label_<slot>` — admin label when `_prof_member_<slot>` is 1
+- `_prof_member_<slot>` — 1 only when presenting a registered identity
 
-## Why `_sp_sv_limit_userinfo_change 1`
+Lookups: `prof_find_by_id` (live slots), `prof_find_by_name` (by admin
+label in registry, not client name). Hook: `set _prof_userinfo_hook myfunc`.
 
-Every userinfo change fires a snapshot round-trip (file event, socket
-dispatch, UDP rcon, snapshot write, delayed re-read). Unlimited changes let
-one client flood that pipeline, and let a player flap `team_red_blue`
-faster than enforcement converges — auditing a moving target. Limit 1 makes
-the server warn and ignore rapid changes, which keeps the event rate bounded
-and gives `prof_audit` / `prof_enforce` a stable value to check and fix.
+## Team collapse (menu swap, sp_sv_client_red/blue)
+
+When `team_red_blue` collapses to bare `0`/`1`, the slot stash restores
+`stash + current_team` via stufftext if the stash holds a registered
+identity. `_prof_restored_<slot>` prevents push loops.
 
 ## Trust notes
 
-- Userinfo is visible to connected players, so identity keys protect
-  against outsiders and casual spoofing, not against a determined sniffer
-  already on the server. Treat keys as bearer tokens among players.
-- Mismatch notices to players are generic on purpose; assigned keys are
-  only ever unicast to the holder's own slot (or pushed silently).
-- Pushes always preserve the known team digit and refuse unknown teams
-  (snapshot requested instead) — the server never flips teams blind.
+Identity keys are bearer tokens in visible userinfo — good against casual
+spoofing, not against sniffers. Mismatch notices are generic; assigned keys
+only go to the holder's slot.
