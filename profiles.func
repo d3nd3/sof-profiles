@@ -17,6 +17,13 @@
 // generic; only the holder's own assigned key (or a fresh onboarding
 // mint) is ever unicast to a slot.
 //
+// Slot-lifetime stash: the first valid identity a slot presents is kept
+// in _prof_stash_<slot> (cleared on disconnect). If the value later
+// collapses to a bare 0/1 (admin team change, menu team swap), the
+// stashed identity is restored with the CURRENT team digit via the
+// userinfo hook -- registry assignments always win over the stash.
+// _prof_restored_<slot> records the last restore to avoid re-pushing.
+//
 // Registry: _prof_reg_<skey> cvars, where <skey> is the nickname run
 // through prof_sanitize (color-strip + delete outside 0-9a-z, same
 // convention as spf_sv_rcon). Persisted to sofplus/data/profiles/
@@ -107,6 +114,8 @@ function prof_client_disconnect(~slot, *)
   set _prof_name_$~slot ""
   set _prof_member_$~slot ""
   set _prof_id_offered_$~slot ""
+  set _prof_stash_$~slot ""
+  set _prof_restored_$~slot ""
 }
 
 function prof_userinfo_changed(~slot)
@@ -357,27 +366,37 @@ function prof_userinfo_read(~slot)
       {
         sp_sc_flow_if text cvar _prof_reg_$~skey == val #_prof_id
         {
-          // Registered + match: bind member triple.
+          // Registered + match: bind member triple, sync stash.
           set _prof_id_$~slot #_prof_id
           set _prof_team_$~slot #_prof_team
           set _prof_name_$~slot #_prof_userinfo_name
           set _prof_member_$~slot 1
           set _prof_id_offered_$~slot 0
+          set _prof_stash_$~slot #_prof_id
+          set _prof_restored_$~slot none
         }
         else
         {
           // Registered but wrong key: no bind, generic notice (no key).
           set _prof_member_$~slot 0
+          set _prof_restored_$~slot none
           sp_sc_func_exec prof_notice_mismatch #~slot
         }
       }
       else
       {
-        // Guest: latch for lookup, never bound as member.
+        // Guest: latch for lookup, never bound as member. Stash the
+        // first valid identity seen for the slot lifetime.
         set _prof_id_$~slot #_prof_id
         set _prof_team_$~slot #_prof_team
         set _prof_name_$~slot #_prof_userinfo_name
         set _prof_member_$~slot 0
+        set _prof_restored_$~slot none
+        sp_sc_cvar_copy ~st _prof_stash_$~slot
+        sp_sc_flow_if text val #~st == val ""
+        {
+          set _prof_stash_$~slot #_prof_id
+        }
       }
     }
     else
@@ -393,10 +412,51 @@ function prof_userinfo_read(~slot)
       }
       else
       {
-        // Unknown nickname, no key: onboarding mint offer (manual).
-        sp_sc_flow_if text val #_prof_id_new != val ""
+        // Unknown nickname: restore the stashed identity with the current
+        // team when possible, else onboarding mint offer.
+        sp_sc_cvar_copy ~team _prof_team
+        sp_sc_flow_if text val #~team != val 0
         {
-          sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
+          sp_sc_flow_if text val #~team != val 1
+          {
+            zero ~team
+          }
+        }
+        sp_sc_cvar_copy ~st _prof_stash_$~slot
+        sp_sc_flow_if text val #~team == val ""
+        {
+          sp_sc_flow_if text val #_prof_id_new != val ""
+          {
+            sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
+          }
+        }
+        else
+        {
+          sp_sc_flow_if text val #~st == val ""
+          {
+            sp_sc_flow_if text val #_prof_id_new != val ""
+            {
+              sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
+            }
+          }
+          else
+          {
+            // Restore once per value (recorded; re-armed by valid reads).
+            sp_sc_cvar_sset ~full #~st #~team
+            sp_sc_cvar_copy ~rec _prof_restored_$~slot
+            sp_sc_flow_if text cvar ~rec != val #~full
+            {
+              sp_sc_flow_if text val #_prof_use_stufftext == val 1
+              {
+                stufftext #~slot set team_red_blue #~full u
+                set _prof_restored_$~slot #~full
+              }
+              else
+              {
+                sp_sc_func_exec prof_offer_key #~slot #~full
+              }
+            }
+          }
         }
       }
     }

@@ -69,6 +69,13 @@ registry-verified bindings). Lookups: `prof_find_by_id`,
 `prof_find_by_name` (-> `_prof_found_slot`). Hook: `set
 _prof_userinfo_hook myfunc`.
 
+Slot-lifetime stash: the first valid identity a slot presents is kept in
+`_prof_stash_<slot>` (cleared on disconnect). If the value later collapses
+to a bare `0`/`1` — admin team change or menu team swap — the stashed
+identity is restored with the *current* team digit through the userinfo
+hook (once per value, tracked in `_prof_restored_<slot>`). Registry
+assignments always win over the stash.
+
 ## Why `_sp_sv_limit_userinfo_change 1`
 
 Every userinfo change fires a snapshot round-trip (file event, socket
