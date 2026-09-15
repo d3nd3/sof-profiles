@@ -292,17 +292,18 @@ function prof_admin_load()
   }
 }
 
-// Live client info for ~slot: ~ps_present 0/1, ~ps_name, ~ps_spec.
+// Live client info for ~slot. Globals _prof_ps_present/_prof_ps_name/_prof_ps_spec
+// (not ~ temps) so callers see the result after sp_sc_func_exec.
 function prof_slot_info(~slot)
 {
-  set ~ps_present 0
+  set _prof_ps_present 0
   zero _sp_sv_info_client_ip
   sp_sv_info_client #~slot
   sp_sc_flow_if text cvar _sp_sv_info_client_ip != val ""
   {
-    set ~ps_present 1
-    sp_sc_cvar_copy ~ps_name _sp_sv_info_client_name
-    sp_sc_cvar_copy ~ps_spec _sp_sv_info_client_spectator
+    set _prof_ps_present 1
+    sp_sc_cvar_copy _prof_ps_name _sp_sv_info_client_name
+    sp_sc_cvar_copy _prof_ps_spec _sp_sv_info_client_spectator
   }
 }
 
@@ -500,11 +501,11 @@ function prof_audit()
   sp_sc_flow_while number cvar ~i < cvar maxclients
   {
     sp_sc_func_exec prof_slot_info #~i
-    sp_sc_flow_if number cvar ~ps_present == val 1
+    sp_sc_flow_if number cvar _prof_ps_present == val 1
     {
-      sp_sc_flow_if text cvar ~ps_spec == val 0
+      sp_sc_flow_if text cvar _prof_ps_spec == val 0
       {
-        sp_sc_func_exec prof_sanitize #~ps_name
+        sp_sc_func_exec prof_sanitize #_prof_ps_name
         sp_sc_cvar_copy ~skey _prof_skey
         sp_sc_cvar_sset ~snap userinfo/snapshot_ $~i .cfg
         sp_sc_file_find ~f sofplus/data/$~snap filesystem file
@@ -522,28 +523,28 @@ function prof_audit()
               }
               else
               {
-                sset ~msg slot #~i #~ps_name wrong: #_prof_userinfo_team_red_blue
+                sset ~msg slot #~i #_prof_ps_name wrong: #_prof_userinfo_team_red_blue
                 echo $~msg
                 add ~nbad 1
               }
             }
             else
             {
-              sset ~msg slot #~i #~ps_name wrong: #_prof_userinfo_team_red_blue
+              sset ~msg slot #~i #_prof_ps_name wrong: #_prof_userinfo_team_red_blue
               echo $~msg
               add ~nbad 1
             }
           }
           else
           {
-            sset ~msg slot #~i #~ps_name guest: #_prof_userinfo_team_red_blue
+            sset ~msg slot #~i #_prof_ps_name guest: #_prof_userinfo_team_red_blue
             echo $~msg
             add ~nguest 1
           }
         }
         else
         {
-          sset ~msg slot #~i #~ps_name pending: no snapshot yet, requesting
+          sset ~msg slot #~i #_prof_ps_name pending: no snapshot yet, requesting
           echo $~msg
           sp_sc_func_exec prof_request_snapshot #~i
           add ~npending 1
@@ -571,13 +572,13 @@ function prof_apply()
   else
   {
     sp_sc_func_exec prof_slot_info #~slot
-    sp_sc_flow_if number cvar ~ps_present != val 1
+    sp_sc_flow_if number cvar _prof_ps_present != val 1
     {
       echo "prof_apply: slot empty"
     }
     else
     {
-      sp_sc_func_exec prof_sanitize #~ps_name
+      sp_sc_func_exec prof_sanitize #_prof_ps_name
       sp_sc_cvar_copy ~skey _prof_skey
       sp_sc_flow_if text cvar _prof_reg_$~skey == val ""
       {
@@ -677,11 +678,11 @@ function prof_enforce()
   sp_sc_flow_while number cvar ~i < cvar maxclients
   {
     sp_sc_func_exec prof_slot_info #~i
-    sp_sc_flow_if number cvar ~ps_present == val 1
+    sp_sc_flow_if number cvar _prof_ps_present == val 1
     {
-      sp_sc_flow_if text cvar ~ps_spec == val 0
+      sp_sc_flow_if text cvar _prof_ps_spec == val 0
       {
-        sp_sc_func_exec prof_sanitize #~ps_name
+        sp_sc_func_exec prof_sanitize #_prof_ps_name
         sp_sc_cvar_copy ~skey _prof_skey
         sp_sc_cvar_sset ~snap userinfo/snapshot_ $~i .cfg
         sp_sc_file_find ~f sofplus/data/$~snap filesystem file
@@ -714,7 +715,7 @@ function prof_enforce()
                   }
                   else
                   {
-                    sset ~msg slot #~i #~ps_name no team data, requesting snapshot
+                    sset ~msg slot #~i #_prof_ps_name no team data, requesting snapshot
                     echo $~msg
                     sp_sc_func_exec prof_request_snapshot #~i
                     add ~npending 1
@@ -738,7 +739,7 @@ function prof_enforce()
                 }
                 else
                 {
-                  sset ~msg slot #~i #~ps_name no team data, requesting snapshot
+                  sset ~msg slot #~i #_prof_ps_name no team data, requesting snapshot
                   echo $~msg
                   sp_sc_func_exec prof_request_snapshot #~i
                   add ~npending 1
@@ -748,14 +749,14 @@ function prof_enforce()
           }
           else
           {
-            sset ~msg slot #~i #~ps_name guest: #_prof_userinfo_team_red_blue
+            sset ~msg slot #~i #_prof_ps_name guest: #_prof_userinfo_team_red_blue
             echo $~msg
             add ~nguest 1
           }
         }
         else
         {
-          sset ~msg slot #~i #~ps_name pending: no snapshot yet, requesting
+          sset ~msg slot #~i #_prof_ps_name pending: no snapshot yet, requesting
           echo $~msg
           sp_sc_func_exec prof_request_snapshot #~i
           add ~npending 1

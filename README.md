@@ -35,13 +35,20 @@ print another identity's key.
    `user-<PORT>/sofplus/addons/` (or `base/sofplus/addons/`). Requires the
    buddy `stufftext` mod for server-pushed keys; without it everything
    degrades to printed `set ... u` instructions.
-2. Run one sof-export-fire server per SoF root:
-   `python sof_export_fire.py --root <SoF root> --serve 127.0.0.1:8765`.
+2. Symlink `user-<PORT>` → `User` in the SoF root (export-fire extracts the
+   game port from that path; ext_trigger writes under `User/sofplus/data/`).
+   Run one sof-export-fire watcher per server instance — point `--root` at
+   the `user-<PORT>` directory, not the full game tree (recursive inotify on
+   the install root is unreliable on Linux):
+   `python sof_export_fire.py --root <SoF root>/user-<PORT> --serve 127.0.0.1:8765`.
 3. Run `userinfo_rcon.py` with `RCON_PASSWORD` set (server
    `rcon_password`). Optional env: `EXPORT_FIRE_HOST/PORT`, `RCON_HOST`,
    `RCON_PORT` (0 = game port from the event), `RCON_TIMEOUT/QUIET`,
    `EXTRA_USERINFO_KEYS`, `VERBOSE=1`.
 4. Set `_sp_sv_limit_userinfo_change 1` on the server (see below).
+5. For remote rcon `sp_sc_func_exec` calls, create the swap alias once per
+   server process:
+   `sp_sc_alias swap 'sp_sv_client_swap #{1}'`
 
 ## Admin workflow
 
