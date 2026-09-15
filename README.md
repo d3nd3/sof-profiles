@@ -67,9 +67,10 @@ label in registry, not client name). Hook: `set _prof_userinfo_hook myfunc`.
 
 ## Team collapse (menu swap, sp_sv_client_red/blue)
 
-When `team_red_blue` collapses to bare `0`/`1`, run `prof_enforce` to push
-the stashed registered identity (never auto-stufftext on the userinfo hook —
-that caused a feedback loop). `_prof_snap_busy_<slot>` coalesces snapshot
+When `team_red_blue` collapses to bare `0`/`1`, the next snapshot read
+auto-pushes `stash + current_team` for registered slots (deduped against
+live userinfo, not the last push). `prof_enforce` sweeps all slots manually.
+`_prof_snap_busy_<slot>` / `_prof_snap_pending_<slot>` coalesce snapshot
 round-trips while one is in flight.
 
 ## Trust notes

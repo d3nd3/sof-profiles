@@ -21,9 +21,10 @@
 // Mint: python3 userinfo_rcon.py --mint
 //
 // Slot-lifetime stash: first valid identity a slot presents -> _prof_stash_<slot>.
-// Bare 0/1 collapse is fixed only via prof_enforce / prof_apply (never auto-
-// stufftext on userinfo hook — that caused a stufftext->userinfo->snapshot loop).
-// _prof_snap_busy_<slot> coalesces overlapping snapshot round-trips.
+// Bare 0/1 collapse: prof_maybe_fixup stufftexts stash+team when live userinfo
+// differs (dedup on _prof_userinfo_team_red_blue, not last push). prof_enforce
+// for manual sweep. _prof_snap_busy_<slot> + _prof_snap_pending_<slot> coalesce
+// snapshot round-trips.
 //
 // Flow: ext_trigger -> userinfo_rcon -> snapshot_<slot>.cfg -> prof_userinfo_read.
 // Consumer hook: set _prof_userinfo_hook myfunc
@@ -66,6 +67,8 @@ function profiles_init()
 
 function prof_client_begin(~slot)
 {
+  set _prof_read_slot #~slot
+  set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
   sp_sc_func_exec prof_request_snapshot #~slot
 }
 
@@ -79,32 +82,46 @@ function prof_client_disconnect(~slot, *)
   set _prof_stash_$~slot ""
   set _prof_restored_$~slot ""
   set _prof_snap_busy_$~slot ""
+  set _prof_snap_pending_$~slot ""
 }
 
 function prof_userinfo_changed(~slot)
 {
+  set _prof_read_slot #~slot
   sp_sc_flow_if text val #_prof_snap_busy_$~slot == val 1
   {
-    // Coalesce rapid changes (e.g. team flap) while a snapshot is in flight.
+    set _prof_snap_pending_$~slot 1
   }
   else
   {
+    set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
     sp_sc_func_exec prof_request_snapshot #~slot
   }
+}
+
+function prof_userinfo_read_deferred()
+{
+  sp_sc_cvar_copy ~slot _prof_read_slot
+  sp_sc_func_exec prof_userinfo_read #~slot
 }
 
 function prof_request_snapshot(~slot)
 {
   set _prof_snap_busy_$~slot 1
+  set _prof_read_slot #~slot
   sp_sc_func_exec ext_trigger_fire "userinfo" #~slot "" "" ""
   set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
-  sset ~cmd sp_sc_func_exec prof_userinfo_read #~slot
-  sp_sc_timer #_prof_userinfo_delay #~cmd
+  sp_sc_timer #_prof_userinfo_delay "sp_sc_func_exec prof_userinfo_read_deferred"
 }
 
 function prof_snapshot_done(~slot)
 {
   set _prof_snap_busy_$~slot 0
+  sp_sc_flow_if text val #_prof_snap_pending_$~slot == val 1
+  {
+    set _prof_snap_pending_$~slot 0
+    sp_sc_func_exec prof_request_snapshot #~slot
+  }
 }
 
 function prof_register()
@@ -339,29 +356,49 @@ function prof_notice_mismatch(~slot)
   }
 }
 
-// Push stash+team once per value (prof_enforce / prof_apply only).
+// Push stash+current_team when live userinfo != stash+team (dedup on client value).
 function prof_restore_stash_push(~slot)
 {
-  sp_sc_cvar_copy ~team _prof_team
+  sp_sc_cvar_copy ~team _prof_team_$~slot
   sp_sc_flow_if text val #~team != val 0
   {
     sp_sc_flow_if text val #~team != val 1
     {
-      zero ~team
+      sp_sc_cvar_copy ~team _prof_team
     }
   }
   sp_sc_cvar_copy ~st _prof_stash_$~slot
   sp_sc_flow_if text val #~st != val ""
   {
     sp_sc_cvar_sset ~full #~st #~team
-    sp_sc_cvar_copy ~rec _prof_restored_$~slot
-    sp_sc_flow_if text cvar ~rec != val #~full
+    sp_sc_cvar_copy ~cur _prof_userinfo_team_red_blue
+    sp_sc_flow_if text cvar ~cur != val #~full
     {
       sp_sc_cvar_copy _prof_push_id _prof_stash_$~slot
       sp_sc_func_exec prof_push_checked #~slot #~team
       sp_sc_flow_if text val #_prof_push_rc == val pushed
       {
         set _prof_restored_$~slot #~full
+        set _prof_team_$~slot #~team
+      }
+    }
+  }
+}
+
+function prof_maybe_fixup(~slot)
+{
+  sp_sc_flow_if text val #_prof_id_valid == val 1
+  {
+  }
+  else
+  {
+    sp_sc_cvar_copy _prof_lookup_id _prof_stash_$~slot
+    sp_sc_flow_if text val #_prof_lookup_id != val ""
+    {
+      sp_sc_func_exec prof_reg_lookup
+      sp_sc_flow_if text val #_prof_registered == val 1
+      {
+        sp_sc_func_exec prof_restore_stash_push #~slot
       }
     }
   }
@@ -417,6 +454,7 @@ function prof_userinfo_read(~slot)
     {
       set _prof_member_$~slot 0
       set _prof_id_$~slot ""
+      set _prof_team_$~slot #_prof_team
       sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
       {
         sp_sc_cvar_copy ~st _prof_stash_$~slot
@@ -429,6 +467,8 @@ function prof_userinfo_read(~slot)
         }
       }
     }
+
+    sp_sc_func_exec prof_maybe_fixup #~slot
 
     sp_sc_flow_if text val #_prof_userinfo_hook != val ""
     {
@@ -443,8 +483,8 @@ function prof_userinfo_read(~slot)
       sp_sc_cvar_copy ~tries _prof_userinfo_tries_$~slot
       add ~tries -1
       set _prof_userinfo_tries_$~slot #~tries
-      sset ~cmd sp_sc_func_exec prof_userinfo_read #~slot
-      sp_sc_timer #_prof_userinfo_delay #~cmd
+      set _prof_read_slot #~slot
+      sp_sc_timer #_prof_userinfo_delay "sp_sc_func_exec prof_userinfo_read_deferred"
     }
     else
     {
