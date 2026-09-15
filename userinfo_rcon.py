@@ -270,7 +270,7 @@ def handle_event(event: dict, cfg: Config) -> Optional[str]:
         "_prof_id": identity,
         "_prof_team": str(team),
         # Fresh candidate for unregistered players; the .func offers it
-        # once for `set team_red_blue <id><team> u`. Minted even for
+        # once for `team_red_blue "<id><team>"`. Minted even for
         # garbage values (team digit resolved script-side).
         "_prof_id_new": "" if valid else mint_identity(),
     }
