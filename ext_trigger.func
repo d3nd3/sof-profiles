@@ -1,0 +1,106 @@
+// ---------------------------------------------------------------------------
+// ext_trigger.func - generic external trigger for script observers.
+//
+// Purpose: let any in-game script notify an out-of-game process (python,
+// shell, ...) by writing a small cfg file. The observer watches the
+// filesystem for modifications and reacts. This generalises the
+// sof-discord-bot pattern (info_client.func -> info_server/server.cfg ->
+// python watchdog) so any addon can fire named triggers without copying
+// that one-off logic.
+//
+// Addon-loader contract: place this file in sofplus/addons/ as
+//   ext_trigger.func
+// The loader (spf_sc_addons.func) loads sofplus/addons/*.func and calls
+// <basename>_init, i.e. ext_trigger_init below.
+//
+// Fire contract (in-game, from any other .func):
+//   sp_sc_func_exec ext_trigger_fire "<name>" "<slot>" "<arg1>" "<arg2>" "<arg3>"
+//   - <name>: trigger/channel name, required. Keep to [A-Za-z0-9_-]+ so it
+//     maps cleanly to a filename. Example: "match_request", "upload_match".
+//   - <slot>: client slot that caused the trigger, or -1 / "" when none.
+//     Pass #~slot from a dot-command handler (e.g. function .foo(~slot, *)).
+//   - <arg1..3>: optional free-form string args. Avoid embedded double
+//     quotes and newlines; the file format is set "k" "v" per line.
+//     If you need richer data, save your own snapshot files FIRST (e.g.
+//     info_client/player_<slot>.cfg) and pass a pointer via args.
+//
+// Observer contract (out-of-game):
+//   - Files land under <user-PORT>/sofplus/data/ext_trigger/ :
+//       ext_trigger/<name>.cfg   per-trigger file (watch *.cfg)
+//       ext_trigger/last.cfg     always overwritten with the latest fire,
+//                                for observers that prefer a single path
+//     (sp_sc_cvar_save paths are relative to sofplus/data/.)
+//   - Each file is a list of set "key" "value" lines, latin-1 encoded.
+//     Parse with:  set "([^"]+)" "([^"]*)"
+//   - Payload keys: _ext_trigger_name, _ext_trigger_seq, _ext_trigger_slot,
+//     _ext_trigger_arg1..3, _ext_trigger_time (sec since SoF start),
+//     _ext_trigger_datetime (if provided by sp_sc_info_time), plus
+//     hostname, mapname, _sp_sv_info_map_current for context.
+//   - _ext_trigger_seq is monotonic per server process. Observers MUST
+//     deduplicate on (trigger, seq): watchdog may coalesce rapid writes
+//     and will re-fire on unrelated mtime bumps. Apply a small cooldown
+//     (discord-bot uses ~10s per port; 1s+ settle sleep before reading).
+//   - Extract the server port from the path via user-(\d+), as the data
+//     dir is per server instance (../user-<port>/sofplus/data).
+//
+// Example producer (other addon):
+//   function .wantplay(~slot, *)
+//   {
+//     sp_sc_func_exec ext_trigger_fire "match_request" #~slot "wantplay" "" ""
+//   }
+//
+// Example observer: see sof-export-fire/sof_export_fire.py
+// (generic python watcher; sibling project next to sof-profiles).
+// ---------------------------------------------------------------------------
+
+function ext_trigger_init()
+{
+  // Monotonic sequence so observers can deduplicate coalesced events.
+  // Only initialise when empty so a mid-map file reload keeps counting.
+  sp_sc_flow_if text val #_ext_trigger_seq == val ""
+  {
+    set _ext_trigger_seq 0
+  }
+}
+
+function ext_trigger_fire(~name, ~slot, ~arg1, ~arg2, ~arg3)
+{
+  sp_sc_flow_if text val #~name == val ""
+  {
+    echo "ext_trigger_fire: missing trigger name, ignoring"
+  }
+  else
+  {
+    // Normalise optional slot to -1 when the caller passed "".
+    sp_sc_flow_if text val #~slot == val ""
+    {
+      set ~slot -1
+    }
+
+    // Defensive init (init runs via addon loader, but direct loads skip it).
+    sp_sc_flow_if text val #_ext_trigger_seq == val ""
+    {
+      set _ext_trigger_seq 0
+    }
+    add _ext_trigger_seq 1
+
+    // Timestamp for humans; observers should order/dedupe by seq, not time.
+    sp_sc_info_time
+    sp_sc_cvar_copy _ext_trigger_time _sp_sc_info_time_sec
+    sp_sc_cvar_copy _ext_trigger_datetime _sp_sc_info_time_datetime
+
+    // Latch the payload into globals for sp_sc_cvar_save (+wildcard save).
+    sp_sc_cvar_copy _ext_trigger_name ~name
+    sp_sc_cvar_copy _ext_trigger_slot ~slot
+    sp_sc_cvar_copy _ext_trigger_arg1 ~arg1
+    sp_sc_cvar_copy _ext_trigger_arg2 ~arg2
+    sp_sc_cvar_copy _ext_trigger_arg3 ~arg3
+
+    // Per-trigger file: ext_trigger/<name>.cfg (relative to sofplus/data/).
+    sp_sc_cvar_sset ~file ext_trigger/ #~name .cfg
+    sp_sc_cvar_save #~file hostname mapname _sp_sv_info_map_current _ext_trigger_*
+
+    // Stable single-file alias for observers watching one path.
+    sp_sc_cvar_save ext_trigger/last.cfg hostname mapname _sp_sv_info_map_current _ext_trigger_*
+  }
+}

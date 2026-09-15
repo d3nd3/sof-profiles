@@ -1,0 +1,683 @@
+// ---------------------------------------------------------------------------
+// profiles.func - admin-assigned player identity via team_red_blue.
+//
+// Identity design: team_red_blue carries <62 random digits><team 0/1>.
+// The game reads it with atoi and uses the smallest bit (0 = blue,
+// 1 = red); parity survives atoi overflow, so the last char stays the
+// team bit and the leading digits are the player identity (~206 bits,
+// infeasible to brute force). Budget (worst case): values cap at 63
+// usable chars; a 63-char team_red_blue costs 78 of the 512 info-string
+// bytes, leaving a guaranteed 434 for the rest (the engine rejects
+// over-budget sets, it never truncates).
+//
+// Authority model: the ADMIN identifies users. The server never invents
+// bindings -- it only enforces admin-registered nickname -> identity
+// mappings, on explicit admin order (prof_apply / prof_enforce). Player
+// notices never print another identity's key: mismatch notes are
+// generic; only the holder's own assigned key (or a fresh onboarding
+// mint) is ever unicast to a slot.
+//
+// Registry: _prof_reg_<skey> cvars, where <skey> is the nickname run
+// through prof_sanitize (color-strip + delete outside 0-9a-z, same
+// convention as spf_sv_rcon). Persisted to sofplus/data/profiles/
+// registry.cfg (autosaved on add/del, loaded in profiles_init).
+// Mint fresh identities with: python3 userinfo_rcon.py --mint
+//
+// Flow:
+//  1. prof_client_begin / prof_userinfo_changed request a snapshot via
+//     ext_trigger_fire "userinfo" <slot> (needs ext_trigger.func).
+//  2. userinfo_rcon.py sends UDP `rcon dumpuser`, splits team_red_blue
+//     into _prof_id/_prof_team/_prof_id_valid (minting _prof_id_new) and
+//     writes sofplus/data/userinfo/snapshot_<slot>.cfg.
+//  3. prof_userinfo_read(~slot) execs the snapshot, then:
+//        registry hit + id match ... bind member triple
+//                                     (_prof_id_/_prof_team_/_prof_name_<slot>,
+//                                      _prof_member_<slot> = 1)
+//        registry hit + mismatch ..... member 0, generic notice (no key)
+//        registry hit, no usable key . unicast assigned key for manual apply
+//        registry miss + valid ....... guest latch (member 0), silent
+//        registry miss + invalid ..... onboarding mint offer (manual)
+//  4. Consumer hook _prof_userinfo_hook runs with the slot.
+//
+// Server-side aliases (console-callable via sp_sc_func_alias):
+//   prof_register <slot> ......... request (re)binding now.
+//   prof_find_by_id <id> ......... sets _prof_found_slot (slot or -1).
+//   prof_find_by_name <name> ..... exact nickname match -> _prof_found_slot.
+//   prof_admin_add <nick> <id62> . register nickname (autosaves).
+//   prof_admin_del <nick> ........ unregister (autosaves).
+//   prof_admin_save / load ....... registry file write/read.
+//   prof_audit ................... report every non-spectator slot: ok /
+//                                  wrong (slot, name, current value) /
+//                                  guest / pending.
+//   prof_apply <slot> ............ push the REGISTERED identity now
+//                                  (refuses unregistered nicknames).
+//   prof_enforce ................. prof_audit + push fixes for registered
+//                                  mismatches (never invents bindings).
+// Consumer opt-in: set _prof_userinfo_hook myfunc (+ function myfunc(~slot)).
+// Timing tune: set _prof_userinfo_delay <ms> (default 1000).
+// Recommended: set _sp_sv_limit_userinfo_change 1 (see README).
+// ---------------------------------------------------------------------------
+
+function profiles_init()
+{
+  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_begin "prof_client_begin"
+  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_userinfo_change "prof_userinfo_changed"
+  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_disconnect "prof_client_disconnect"
+
+  sp_sc_func_alias prof_register prof_register
+  sp_sc_func_alias prof_find_by_id prof_find_by_id
+  sp_sc_func_alias prof_find_by_name prof_find_by_name
+  sp_sc_func_alias prof_admin_add prof_admin_add
+  sp_sc_func_alias prof_admin_del prof_admin_del
+  sp_sc_func_alias prof_admin_save prof_admin_save
+  sp_sc_func_alias prof_admin_load prof_admin_load
+  sp_sc_func_alias prof_audit prof_audit
+  sp_sc_func_alias prof_apply prof_apply
+  sp_sc_func_alias prof_enforce prof_enforce
+
+  sp_sc_flow_if text val #_prof_userinfo_delay == val ""
+  {
+    set _prof_userinfo_delay 1000
+  }
+  sp_sc_flow_if text val #_prof_userinfo_tries == val ""
+  {
+    set _prof_userinfo_tries 3
+  }
+  sp_sc_flow_if text val #_prof_use_stufftext == val ""
+  {
+    set _prof_use_stufftext 1
+  }
+
+  sp_sc_func_exec prof_admin_load
+}
+
+function prof_client_begin(~slot)
+{
+  sp_sc_func_exec prof_request_snapshot #~slot
+}
+
+function prof_client_disconnect(~slot, *)
+{
+  set _prof_id_$~slot ""
+  set _prof_team_$~slot ""
+  set _prof_name_$~slot ""
+  set _prof_member_$~slot ""
+  set _prof_id_offered_$~slot ""
+}
+
+function prof_userinfo_changed(~slot)
+{
+  sp_sc_func_exec prof_request_snapshot #~slot
+}
+
+function prof_request_snapshot(~slot)
+{
+  // Export the change; the external helper returns data via snapshot file.
+  sp_sc_func_exec ext_trigger_fire "userinfo" #~slot "" "" ""
+
+  // Snapshot arrives asynchronously (socket bus + UDP rcon); read it later.
+  set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
+  sset ~cmd sp_sc_func_exec prof_userinfo_read #~slot
+  sp_sc_timer #_prof_userinfo_delay #~cmd
+}
+
+function prof_register(~slot)
+{
+  sp_sc_flow_if text val #~slot == val ""
+  {
+    echo "usage: prof_register <slot>"
+  }
+  else
+  {
+    sp_sc_func_exec prof_request_snapshot #~slot
+  }
+}
+
+function prof_find_by_id(~id)
+{
+  set _prof_found_slot -1
+  sp_sc_flow_if text val #~id != val ""
+  {
+    set ~i 0
+    sp_sc_flow_while number cvar ~i < cvar maxclients
+    {
+      sp_sc_flow_if text cvar _prof_id_$~i == val #~id
+      {
+        set _prof_found_slot #~i
+      }
+      add ~i 1
+    }
+  }
+}
+
+function prof_find_by_name(~name)
+{
+  set _prof_found_slot -1
+  sp_sc_flow_if text val #~name != val ""
+  {
+    set ~i 0
+    sp_sc_flow_while number cvar ~i < cvar maxclients
+    {
+      sp_sc_flow_if text cvar _prof_name_$~i == val #~name
+      {
+        set _prof_found_slot #~i
+      }
+      add ~i 1
+    }
+  }
+}
+
+// Sanitize a nickname into a registry key (colors stripped, only 0-9a-z
+// kept -- same convention as spf_sv_rcon). Result in _prof_skey.
+function prof_sanitize(~text)
+{
+  sp_sc_cvar_no_color ~plain #~text
+  sp_sc_cvar_replace ~plain ~plain "%00-%2f:" "%3a-%60:" "%7b-%ff:"
+  sp_sc_cvar_sset _prof_skey #~plain
+}
+
+function prof_admin_add(~nickname, ~identity)
+{
+  sp_sc_flow_if text val #~nickname == val ""
+  {
+    echo "usage: prof_admin_add <nickname> <identity62> (mint: python3 userinfo_rcon.py --mint)"
+  }
+  else
+  {
+    sp_sc_flow_if text val #~identity == val ""
+    {
+      echo "usage: prof_admin_add <nickname> <identity62> (mint: python3 userinfo_rcon.py --mint)"
+    }
+    else
+    {
+      sp_sc_cvar_len ~len ~identity
+      sp_sc_flow_if number cvar ~len != val 62
+      {
+        echo "prof_admin_add: identity must be 62 digits"
+      }
+      else
+      {
+        sp_sc_cvar_copy ~digits ~identity
+        sp_sc_cvar_replace ~digits ~digits "%30:" "%31:" "%32:" "%33:" "%34:" "%35:" "%36:" "%37:" "%38:" "%39:"
+        sp_sc_flow_if text cvar ~digits != val ""
+        {
+          echo "prof_admin_add: identity must be digits only"
+        }
+        else
+        {
+          sp_sc_func_exec prof_sanitize #~nickname
+          sp_sc_flow_if text val #_prof_skey == val ""
+          {
+            echo "prof_admin_add: nickname sanitizes to empty"
+          }
+          else
+          {
+            sp_sc_cvar_sset ~reg _prof_reg_ #_prof_skey
+            set #~reg #~identity
+            sp_sc_func_exec prof_admin_save
+            sset ~msg registry updated for #~nickname
+            echo $~msg
+          }
+        }
+      }
+    }
+  }
+}
+
+function prof_admin_del(~nickname)
+{
+  sp_sc_flow_if text val #~nickname == val ""
+  {
+    echo "usage: prof_admin_del <nickname>"
+  }
+  else
+  {
+    sp_sc_func_exec prof_sanitize #~nickname
+    sp_sc_flow_if text val #_prof_skey == val ""
+    {
+      echo "prof_admin_del: nickname sanitizes to empty"
+    }
+    else
+    {
+      sp_sc_cvar_sset ~reg _prof_reg_ #_prof_skey
+      set #~reg ""
+      sp_sc_func_exec prof_admin_save
+      sset ~msg registry removed for #~nickname
+      echo $~msg
+    }
+  }
+}
+
+function prof_admin_save()
+{
+  sp_sc_cvar_save profiles/registry.cfg _prof_reg_*
+}
+
+function prof_admin_load()
+{
+  sp_sc_file_find ~f sofplus/data/profiles/registry.cfg filesystem file
+  sp_sc_flow_if number cvar ~f_0 == val 1
+  {
+    sp_sc_exec_file sofplus/data/profiles/registry.cfg
+  }
+}
+
+// Live client info for ~slot: ~ps_present 0/1, ~ps_name, ~ps_spec.
+function prof_slot_info(~slot)
+{
+  set ~ps_present 0
+  zero _sp_sv_info_client_ip
+  sp_sv_info_client #~slot
+  sp_sc_flow_if text cvar _sp_sv_info_client_ip != val ""
+  {
+    set ~ps_present 1
+    sp_sc_cvar_copy ~ps_name _sp_sv_info_client_name
+    sp_sc_cvar_copy ~ps_spec _sp_sv_info_client_spectator
+  }
+}
+
+// Print a key for manual `set team_red_blue <full> u` (once per slot).
+// ~full must already hold the complete value (identity + team digit).
+function prof_offer_key(~slot, ~full)
+{
+  sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
+  {
+    sset ~msg "%04Your identity key, apply once in console: %03set team_red_blue " #~full "%04 u"
+    sp_sc_cvar_unescape ~msg ~msg
+    sp_sv_print_client #~slot #~msg
+    set _prof_id_offered_$~slot 1
+  }
+}
+
+// Offer an identity part with the fresh team digit (defaults blue when the
+// snapshot carries no usable team, so no "-1" suffix can ever be offered).
+function prof_offer_id(~slot, ~idpart)
+{
+  sp_sc_cvar_copy ~team _prof_team
+  sp_sc_flow_if text val #~team != val 0
+  {
+    sp_sc_flow_if text val #~team != val 1
+    {
+      set ~team 0
+    }
+  }
+  sp_sc_cvar_sset ~full #~idpart #~team
+  sp_sc_func_exec prof_offer_key #~slot #~full
+}
+
+// Generic mismatch notice (never carries a key).
+function prof_notice_mismatch(~slot)
+{
+  sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
+  {
+    sset ~msg "%02Identity mismatch, contact an admin."
+    sp_sc_cvar_unescape ~msg ~msg
+    sp_sv_print_client #~slot #~msg
+    set _prof_id_offered_$~slot 1
+  }
+}
+
+function prof_userinfo_read(~slot)
+{
+  sp_sc_cvar_sset ~snap userinfo/snapshot_ $~slot .cfg
+  sp_sc_file_find ~f sofplus/data/$~snap filesystem file
+  sp_sc_flow_if number cvar ~f_0 == val 1
+  {
+    sp_sc_cvar_sset ~exec sofplus/data/ #~snap
+    sp_sc_exec_file #~exec
+    set _prof_userinfo_tries_$~slot 0
+
+    // team_red_blue already split by the helper into
+    // _prof_id/_prof_team/_prof_id_valid (+_prof_id_new when unregistered).
+    // Registry key for this nickname (shared sanitize both sides).
+    sp_sc_func_exec prof_sanitize #_prof_userinfo_name
+    sp_sc_cvar_copy ~skey _prof_skey
+    sp_sc_flow_if text val #_prof_id_valid == val 1
+    {
+      sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
+      {
+        sp_sc_flow_if text cvar _prof_reg_$~skey == val #_prof_id
+        {
+          // Registered + match: bind member triple.
+          set _prof_id_$~slot #_prof_id
+          set _prof_team_$~slot #_prof_team
+          set _prof_name_$~slot #_prof_userinfo_name
+          set _prof_member_$~slot 1
+          set _prof_id_offered_$~slot 0
+        }
+        else
+        {
+          // Registered but wrong key: no bind, generic notice (no key).
+          set _prof_member_$~slot 0
+          sp_sc_func_exec prof_notice_mismatch #~slot
+        }
+      }
+      else
+      {
+        // Guest: latch for lookup, never bound as member.
+        set _prof_id_$~slot #_prof_id
+        set _prof_team_$~slot #_prof_team
+        set _prof_name_$~slot #_prof_userinfo_name
+        set _prof_member_$~slot 0
+      }
+    }
+    else
+    {
+      set _prof_member_$~slot 0
+      set _prof_id_$~slot ""
+      sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
+      {
+        // Registered but no usable key on the client: offer the assigned
+        // one for manual apply (never pushed without an admin order).
+        sp_sc_cvar_copy ~exp _prof_reg_$~skey
+        sp_sc_func_exec prof_offer_id #~slot #~exp
+      }
+      else
+      {
+        // Unknown nickname, no key: onboarding mint offer (manual).
+        sp_sc_flow_if text val #_prof_id_new != val ""
+        {
+          sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
+        }
+      }
+    }
+
+    sp_sc_flow_if text val #_prof_userinfo_hook != val ""
+    {
+      sp_sc_cvar_sset ~cb sp_sc_func_exec " " #_prof_userinfo_hook " " #~slot
+      sp_sc_exec_cvar ~cb
+    }
+  }
+  else
+  {
+    sp_sc_flow_if number cvar _prof_userinfo_tries_$~slot > val 0
+    {
+      sp_sc_cvar_copy ~tries _prof_userinfo_tries_$~slot
+      add ~tries -1
+      set _prof_userinfo_tries_$~slot #~tries
+      sset ~cmd sp_sc_func_exec prof_userinfo_read #~slot
+      sp_sc_timer #_prof_userinfo_delay #~cmd
+    }
+    else
+    {
+      echo "prof_userinfo_read: no snapshot for slot, giving up"
+    }
+  }
+}
+
+// Report every connected non-spectator slot: ok / wrong (with the value
+// they carry) / guest / pending (snapshot requested to converge).
+function prof_audit()
+{
+  set ~nok 0
+  set ~nbad 0
+  set ~nguest 0
+  set ~npending 0
+  set ~i 0
+  sp_sc_flow_while number cvar ~i < cvar maxclients
+  {
+    sp_sc_func_exec prof_slot_info #~i
+    sp_sc_flow_if number cvar ~ps_present == val 1
+    {
+      sp_sc_flow_if text cvar ~ps_spec == val 0
+      {
+        sp_sc_func_exec prof_sanitize #~ps_name
+        sp_sc_cvar_copy ~skey _prof_skey
+        sp_sc_cvar_sset ~snap userinfo/snapshot_ $~i .cfg
+        sp_sc_file_find ~f sofplus/data/$~snap filesystem file
+        sp_sc_flow_if number cvar ~f_0 == val 1
+        {
+          sp_sc_cvar_sset ~exec sofplus/data/ #~snap
+          sp_sc_exec_file #~exec
+          sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
+          {
+            sp_sc_flow_if text val #_prof_id_valid == val 1
+            {
+              sp_sc_flow_if text cvar _prof_reg_$~skey == val #_prof_id
+              {
+                add ~nok 1
+              }
+              else
+              {
+                sset ~msg slot #~i #~ps_name wrong: #_prof_userinfo_team_red_blue
+                echo $~msg
+                add ~nbad 1
+              }
+            }
+            else
+            {
+              sset ~msg slot #~i #~ps_name wrong: #_prof_userinfo_team_red_blue
+              echo $~msg
+              add ~nbad 1
+            }
+          }
+          else
+          {
+            sset ~msg slot #~i #~ps_name guest: #_prof_userinfo_team_red_blue
+            echo $~msg
+            add ~nguest 1
+          }
+        }
+        else
+        {
+          sset ~msg slot #~i #~ps_name pending: no snapshot yet, requesting
+          echo $~msg
+          sp_sc_func_exec prof_request_snapshot #~i
+          add ~npending 1
+        }
+      }
+    }
+    add ~i 1
+  }
+  sset ~msg audit: #~nok ok, #~nbad wrong, #~nguest guests, #~npending pending
+  echo $~msg
+}
+
+// Push the REGISTERED identity to one slot now (admin-ordered).
+// Refuses unregistered nicknames and unknown teams (requests a snapshot
+// instead) -- never invents bindings, never flips teams blind.
+function prof_apply(~slot)
+{
+  sp_sc_flow_if text val #~slot == val ""
+  {
+    echo "usage: prof_apply <slot>"
+  }
+  else
+  {
+    sp_sc_func_exec prof_slot_info #~slot
+    sp_sc_flow_if number cvar ~ps_present != val 1
+    {
+      echo "prof_apply: slot empty"
+    }
+    else
+    {
+      sp_sc_func_exec prof_sanitize #~ps_name
+      sp_sc_cvar_copy ~skey _prof_skey
+      sp_sc_flow_if text cvar _prof_reg_$~skey == val ""
+      {
+        sset ~msg prof_apply: nickname not registered, use prof_admin_add first
+        echo $~msg
+      }
+      else
+      {
+        // Latch only: the fresh _prof_team global may belong to another
+        // slot here (no snapshot was just read), so unknown means abort.
+        sp_sc_cvar_copy ~team _prof_team_$~slot
+        sp_sc_func_exec prof_push_checked #~slot #~team
+        sp_sc_flow_if text val #_prof_push_rc == val failed
+        {
+          echo "prof_apply: no team data yet, requesting snapshot"
+          sp_sc_func_exec prof_request_snapshot #~slot
+        }
+      }
+    }
+  }
+}
+
+// Push _prof_reg_ for ~slot with the latched team (stufftext, or echo the
+// exact command when disabled). Caller verified registration + team:
+// _prof_skey holds the registry key and _prof_team_<slot> is 0/1.
+function prof_push_slot(~slot)
+{
+  sp_sc_cvar_copy ~skey _prof_skey
+  sp_sc_cvar_copy ~team _prof_team_$~slot
+  sp_sc_cvar_copy ~exp _prof_reg_$~skey
+  sp_sc_cvar_sset ~full #~exp #~team
+  sp_sc_flow_if text val #_prof_use_stufftext == val 1
+  {
+    stufftext #~slot set team_red_blue #~full u
+    sset ~msg pushed #~full to slot #~slot
+    echo $~msg
+  }
+  else
+  {
+    sset ~msg run: stufftext #~slot set team_red_blue #~full u
+    echo $~msg
+  }
+}
+
+// Checked push of the registry identity in _prof_skey for ~slot with the
+// EXPLICIT team digit in ~team (callers resolve it; no globals are read
+// here, so a stale _prof_team from another slot can never leak in).
+// Sets _prof_push_rc to pushed / printed / failed. Never pushes blind.
+function prof_push_checked(~slot, ~team)
+{
+  sp_sc_flow_if text val #~team != val 0
+  {
+    sp_sc_flow_if text val #~team != val 1
+    {
+      set _prof_push_rc failed
+    }
+    else
+    {
+      set _prof_team_$~slot #~team
+      sp_sc_func_exec prof_push_slot #~slot
+      sp_sc_flow_if text val #_prof_use_stufftext == val 1
+      {
+        set _prof_push_rc pushed
+      }
+      else
+      {
+        set _prof_push_rc printed
+      }
+    }
+  }
+  else
+  {
+    set _prof_team_$~slot #~team
+    sp_sc_func_exec prof_push_slot #~slot
+    sp_sc_flow_if text val #_prof_use_stufftext == val 1
+    {
+      set _prof_push_rc pushed
+    }
+    else
+    {
+      set _prof_push_rc printed
+    }
+  }
+}
+
+// Batch version of prof_apply over every connected non-spectator slot:
+// registered mismatches get their assigned key pushed now; guests and
+// unknowns are only reported. Never invents bindings.
+function prof_enforce()
+{
+  set ~nok 0
+  set ~nfix 0
+  set ~nmanual 0
+  set ~nguest 0
+  set ~npending 0
+  set ~i 0
+  sp_sc_flow_while number cvar ~i < cvar maxclients
+  {
+    sp_sc_func_exec prof_slot_info #~i
+    sp_sc_flow_if number cvar ~ps_present == val 1
+    {
+      sp_sc_flow_if text cvar ~ps_spec == val 0
+      {
+        sp_sc_func_exec prof_sanitize #~ps_name
+        sp_sc_cvar_copy ~skey _prof_skey
+        sp_sc_cvar_sset ~snap userinfo/snapshot_ $~i .cfg
+        sp_sc_file_find ~f sofplus/data/$~snap filesystem file
+        sp_sc_flow_if number cvar ~f_0 == val 1
+        {
+          sp_sc_cvar_sset ~exec sofplus/data/ #~snap
+          sp_sc_exec_file #~exec
+          sp_sc_flow_if text cvar _prof_reg_$~skey != val ""
+          {
+            sp_sc_flow_if text val #_prof_id_valid == val 1
+            {
+              sp_sc_flow_if text cvar _prof_reg_$~skey == val #_prof_id
+              {
+                set _prof_member_$~i 1
+                add ~nok 1
+              }
+              else
+              {
+                // Fresh team: this slot's snapshot was just exec'd above.
+                sp_sc_func_exec prof_push_checked #~i #_prof_team
+                sp_sc_flow_if text val #_prof_push_rc == val pushed
+                {
+                  add ~nfix 1
+                }
+                else
+                {
+                  sp_sc_flow_if text val #_prof_push_rc == val printed
+                  {
+                    add ~nmanual 1
+                  }
+                  else
+                  {
+                    sset ~msg slot #~i #~ps_name no team data, requesting snapshot
+                    echo $~msg
+                    sp_sc_func_exec prof_request_snapshot #~i
+                    add ~npending 1
+                  }
+                }
+              }
+            }
+            else
+            {
+              // Fresh team: this slot's snapshot was just exec'd above.
+              sp_sc_func_exec prof_push_checked #~i #_prof_team
+              sp_sc_flow_if text val #_prof_push_rc == val pushed
+              {
+                add ~nfix 1
+              }
+              else
+              {
+                sp_sc_flow_if text val #_prof_push_rc == val printed
+                {
+                  add ~nmanual 1
+                }
+                else
+                {
+                  sset ~msg slot #~i #~ps_name no team data, requesting snapshot
+                  echo $~msg
+                  sp_sc_func_exec prof_request_snapshot #~i
+                  add ~npending 1
+                }
+              }
+            }
+          }
+          else
+          {
+            sset ~msg slot #~i #~ps_name guest: #_prof_userinfo_team_red_blue
+            echo $~msg
+            add ~nguest 1
+          }
+        }
+        else
+        {
+          sset ~msg slot #~i #~ps_name pending: no snapshot yet, requesting
+          echo $~msg
+          sp_sc_func_exec prof_request_snapshot #~i
+          add ~npending 1
+        }
+      }
+    }
+    add ~i 1
+  }
+  sset ~msg enforce: #~nok ok, #~nfix pushed, #~nmanual manual, #~nguest guests, #~npending pending
+  echo $~msg
+}
