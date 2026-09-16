@@ -93,11 +93,11 @@ Optional **systemd** units in `systemd/` wrap the two Python services.
 | 2 | Symlink `user-<PORT>` → `User` | Port = game UDP port; triggers write under `user-<PORT>/` |
 | 3 | `mkdir -p …/sofplus/data/profiles` | Registry dir for `registry.cfg` |
 | 4 | Start userinfo_rcon (export-fire if needed) | `systemd/install.sh` or manual (below) |
-| 5 | Rcon once per server process | `_sp_sv_limit_userinfo_change 1`, `swap` alias, paste `profiles_aliases.cfg` |
+| 5 | Server console setup | Once per server **restart** — see below |
 | 6 | Verify | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
 
 **Persists on disk:** `profiles.func`, `registry.cfg`, addon files.  
-**Redo each server start:** `profiles_aliases.cfg` lines, `sp_sc_alias swap …`.  
+**Redo each server restart:** console setup (step 5). SoFplus does not save `sp_sc_alias` to disk.  
 **Redo if host reboots:** userinfo_rcon (and export-fire only if you manage it here).
 
 ### systemd (recommended)
@@ -137,19 +137,56 @@ python3 /path/to/userinfo_rcon.py
 
 Snapshots land in `<SoF user>/sofplus/data/userinfo/snapshot_<slot>.cfg`.
 
-### Rcon aliases (each process)
+### Server console setup (after each restart)
+
+Open the **server console** or connect via **rcon** (in-game `rcon <password> …`, or any
+rcon client). Run the following there. This is not a shell script — each line is a
+command the **game server** must execute.
+
+**What loads automatically**
+
+When the server starts, SoFplus loads `profiles.func` from `sofplus/addons/`. That
+registers hooks and three commands: `prof_admin_save`, `prof_admin_load`, `prof_enforce`.
+
+**What you must run manually**
+
+Commands like `prof_admin_add` and `prof_apply` live in `profiles_aliases.cfg`. That
+file is **not** exec'd by the game. Copy its entire contents into the server
+console/rcon and press Enter (one block paste is fine).
+
+**1. Recommended cvar**
 
 ```text
 set _sp_sv_limit_userinfo_change 1
+```
+
+**2. Optional `swap` shortcut** (handy for testing team-menu collapse)
+
+```text
 sp_sc_alias swap sp_sv_client_swap #{1}
 ```
 
-Paste `profiles_aliases.cfg`. Reload after editing `profiles.func`:
+**3. Register `prof_*` commands** — paste all lines from `profiles_aliases.cfg`:
+
+```text
+sp_sc_alias prof_register 'set _prof_cli_slot #{1}; sp_sc_func_exec fn_register_entry'
+sp_sc_alias prof_get_slot_by_id 'set _prof_cli_guid #{1}; sp_sc_func_exec fn_get_slot_by_id_entry'
+…
+```
+
+(The repo file has the full list; paste the whole file.)
+
+After this you can type e.g. `prof_admin_add <guid> <nickname>` in console/rcon.
+
+**If you edited `profiles.func` without restarting the server**
 
 ```text
 sp_sc_func_load_file sofplus/addons/profiles.func
 sp_sc_func_exec fn_profiles_init
 ```
+
+You still need step 3 above after a full server restart — only `profiles.func`
+reload is covered by the two lines here.
 
 ### Verify
 
@@ -163,13 +200,17 @@ If `pending` and no `snapshot_*.cfg`, check export-fire, userinfo-rcon, and `RCO
 
 ## Commands
 
+Run in server console or rcon. Commands marked *paste* need `profiles_aliases.cfg`
+run once after each server restart; others load from `profiles.func` on boot.
+
 | Command | Args | What it does |
 |---------|------|--------------|
-| `prof_admin_add` | `<guid> <nickname>` | Register; auto-saves |
-| `prof_admin_del` | `<guid> <nickname>` | Remove by guid **or** nickname (other `""`) |
-| `prof_apply` | `<slot> <guid>` | Push registered guid to slot |
+| `prof_admin_add` *paste* | `<guid> <nickname>` | Register; auto-saves |
+| `prof_admin_del` *paste* | `<guid> <nickname>` | Remove by guid **or** nickname (other `""`) |
+| `prof_apply` *paste* | `<slot> <guid>` | Push registered guid to slot |
 | `prof_enforce` | — | Audit all slots (per-slot lines) and stufftext-fix wrong `team_red_blue` |
-| `prof_get_slot_by_id` / `by_nick` | guid / nickname | → `_prof_found_slot` |
+| `prof_get_slot_by_id` / `by_nick` *paste* | guid / nickname | → `_prof_found_slot` |
+| `prof_admin_save` / `load` | — | Save/load `registry.cfg` |
 
 **Rcon latch:**
 
