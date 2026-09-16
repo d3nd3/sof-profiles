@@ -15,13 +15,49 @@ services — not the game server itself). Everything else is manual.
 | # | What | `install.sh` | Notes |
 |---|------|--------------|--------|
 | 1 | Deploy `profiles.func`, `ext_trigger.func` | — | `sofplus/addons/` (names not starting with `-`) |
-| 2 | Symlink `user-<PORT>` → `User` | — | Port = game UDP port; triggers write under `user-<PORT>/` |
+| 2 | `user-<PORT>` path for export-fire | — | Symlink **only if** the game uses `User/` — see below |
 | 3 | `mkdir -p …/sofplus/data/profiles` | — | Registry dir for `registry.cfg` |
-| 4 | Start userinfo_rcon (+ export-fire if needed) | **partial** | Copies unit files + `/etc/sof-profiles/env`; you edit env and `systemctl enable --now` |
+| 4 | Python services + `RCON_PASSWORD` | **partial** | Install units, set env (incl. rcon — must match server), `systemctl enable --now` |
 | 5 | `sofplus-cvars.cfg` | — | Set `_sp_sv_limit_userinfo_change` to `1` — see below |
 | 6 | Debug-Stress-Testing | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
 
 **Persists on disk:** `profiles.func`, `registry.cfg`, `sofplus-cvars.cfg`, addon files.
+
+### `user-<PORT>` path (export-fire needs the port in the folder name)
+
+**export-fire** and **userinfo_rcon.py** watch `…/user-<PORT>/sofplus/data/…` and
+read the **UDP game port from the folder name** (e.g. `user-28921` → rcon port
+`28921` for `dumpuser`). They do not infer the port from a plain `User/` folder.
+
+**Check your layout first:**
+
+| Your server already uses… | What to do |
+|---------------------------|------------|
+| `user-<PORT>/` as its real user tree (e.g. Wine/sof-server convention) | **Nothing.** Point `SOF_USER_ROOT` / `--root` at that folder. |
+| `User/` only (no `user-<PORT>` yet) | Create a **symlink** so Python sees the port in the path while SoF keeps using `User/`. |
+| `user-<PORT>` already exists (anything other than a new symlink you plan to add) | **Do not overwrite.** Use the existing path as-is, or pick a layout that already matches export-fire. |
+
+**Safe symlink** (only when the game uses `User/` and `user-<PORT>` does **not**
+exist yet). Do **not** use `ln -sfn` — `-f` would replace an existing file or
+symlink without warning:
+
+```bash
+cd "<SoF root>"
+PORT=28921    # your game UDP port
+TARGET="user-$PORT"
+
+if [ -e "$TARGET" ]; then
+  echo "$TARGET already exists — skip; use it as SOF_USER_ROOT (do not overwrite)"
+elif [ ! -d User ]; then
+  echo "User/ not found — fix your SoF root path first"
+else
+  ln -s User "$TARGET"
+  echo "Created $TARGET -> User"
+fi
+```
+
+Result: same files on disk, two names — `User/sofplus/data/…` (game) and
+`user-28921/sofplus/data/…` (Python + port in path).
 
 ### systemd (recommended)
 
@@ -35,20 +71,31 @@ command. The lines below:
   `enable`, a reboot stops the processes and snapshots break until you
   `systemctl start` them again by hand.
 
+**RCON password** — only `userinfo_rcon.py` needs this (not export-fire). The script
+sends UDP `rcon dumpuser` when a userinfo trigger fires. It reads `RCON_PASSWORD`
+from the environment — **not** from the game. Set it to the same value as the
+server’s `rcon_password` (what you use after `rcon` in-game). Wrong password → no
+snapshots, `prof_enforce` stays `pending`. Keep it out of git.
+
 **export-fire already running** (another feature on the same host):
 
 ```bash
 ./systemd/install.sh --rcon-only
-# edit /etc/sof-profiles/env — SOF_PROFILES, RCON_PASSWORD; EXPORT_FIRE_HOST/PORT if not defaults
+# edit /etc/sof-profiles/env:
+#   SOF_PROFILES=/path/to/sof-profiles
+#   RCON_PASSWORD=<same as server rcon_password>
 ./systemd/install.sh --rcon-only
 sudo systemctl enable --now userinfo-rcon
 ```
+
+`userinfo-rcon.service` loads `/etc/sof-profiles/env` via `EnvironmentFile=`.
 
 **Fresh host** (no export-fire yet):
 
 ```bash
 ./systemd/install.sh
-# edit /etc/sof-profiles/env — SOF_USER_ROOT, SOF_EXPORT_FIRE, SOF_PROFILES, RCON_PASSWORD
+# edit /etc/sof-profiles/env:
+#   SOF_USER_ROOT, SOF_EXPORT_FIRE, SOF_PROFILES, RCON_PASSWORD (see above)
 ./systemd/install.sh
 sudo systemctl enable --now export-fire userinfo-rcon
 ```
@@ -60,15 +107,17 @@ enabled.
 ### Manual (no systemd)
 
 ```bash
-# export-fire (sof-export-fire project)
+# export-fire (sof-export-fire project) — no rcon password needed
 python3 sof_export_fire.py --root "<SoF>/user-<PORT>" --serve 127.0.0.1:8765
 
-# userinfo_rcon (this repo)
+# userinfo_rcon — RCON_PASSWORD must match server rcon_password
 export RCON_PASSWORD='<rcon_password>'
 python3 /path/to/userinfo_rcon.py
 ```
 
-Snapshots land in `<SoF user>/sofplus/data/userinfo/snapshot_<slot>.cfg`.
+Optional env: `RCON_HOST` (default `127.0.0.1`), `RCON_PORT` (default `0` = port from
+`user-<PORT>` in each trigger). Snapshots land in
+`<SoF user>/sofplus/data/userinfo/snapshot_<slot>.cfg`.
 
 ### `sofplus-cvars.cfg`
 
@@ -243,8 +292,8 @@ Without two variables we would lose the guid the moment userinfo collapsed.
 ## `userinfo_rcon.py`
 
 Watches export-fire `userinfo` events → `rcon dumpuser <slot>` →
-`snapshot_<slot>.cfg`. Env: `RCON_PASSWORD` (required), `EXPORT_FIRE_HOST`/`PORT`,
-`RCON_HOST`/`PORT`, `VERBOSE`.
+`snapshot_<slot>.cfg`. `RCON_PASSWORD` and paths: **Setup step 4**. Other env:
+`EXPORT_FIRE_HOST`/`PORT`, `RCON_HOST`/`PORT`, `VERBOSE`.
 
 ## Rcon testing
 
