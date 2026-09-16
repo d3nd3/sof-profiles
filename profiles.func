@@ -1,66 +1,20 @@
-// ---------------------------------------------------------------------------
-// profiles.func - admin-assigned player identity via team_red_blue.
-//
-// Identity design: team_red_blue carries <24 random digits><team 0/1>
-// (25 chars total; ~80 bits). Legacy 62-digit registry keys still work.
-// The game reads it with atoi and uses the smallest bit (0 = blue,
-// 1 = red); parity survives atoi overflow, so the last char stays the
-// team bit and the leading digits are the player identity. Engine cap:
-// 63 usable chars per userinfo value (512-byte info-string budget).
-//
-// Authority model: the ADMIN registers identities with a required label.
-// Client userinfo "name" is never read for matching. Recognition is
-// purely by the identity digits in team_red_blue. Admin labels are
-// metadata for humans and prof_get_slot_by_nick (registry index only).
-//
-// Registry (profiles/registry.cfg) — persisted via ~ locals + sp_sc_cvar_save
-// (same pattern as ~user_* in spf_sv_rcon):
-//   ~reg_<guid>              = nickname (required on add; 24- or 62-digit guid)
-//   ~guid_by_<nickname_clean> = guid digits (nickname_clean = prof_nickname_clean(nickname))
-// Mint: python3 userinfo_rcon.py --mint
-//
-// Two team sources (do not confuse):
-//   team_red_blue  — userinfo / snapshot / dumpuser; carries identity GUID + bit.
-//   _sp_sv_info_client_team — sp_sv_info_client; in-memory server team only
-//     (1=blue, 2=red). No identity. Used to pick the team bit when re-pushing
-//     stash after collapse; audit/identity always use team_red_blue snapshots.
-//
-// Two per-slot guid cvars (digits only, no team bit):
-//   _prof_guid_<slot>            — last good snapshot (cleared/stale on 0/1 collapse)
-//   _prof_remembered_guid_<slot> — connection anchor; set once, used to re-push after collapse
-// Bare 0/1 collapse: prof_maybe_fixup stufftexts remembered_guid+team when live userinfo
-// differs (dedup on _prof_userinfo_team_red_blue, not last push). prof_enforce
-// for manual sweep. _prof_snap_busy_<slot> + _prof_snap_pending_<slot> coalesce
-// snapshot round-trips. prof_map_begin clears slot state on map change.
-//
-// Flow: ext_trigger -> userinfo_rcon -> snapshot_<slot>.cfg -> fn_userinfo_read.
-// Consumer hook: set _prof_userinfo_hook myfunc
-// Per-slot: _prof_guid_<slot>, _prof_team_<slot>, _prof_nickname_<slot>, _prof_is_registered_<slot>
-// Recommended: set _sp_sv_limit_userinfo_change 1 (see README).
-// ---------------------------------------------------------------------------
-
-// sofplus addon loader calls profiles_init (basename_init); delegate to fn_*.
 function profiles_init()
-{
-  sp_sc_func_exec fn_profiles_init
-}
-
-function fn_profiles_init()
 {
   sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_begin "fn_client_begin"
   sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_userinfo_change "fn_userinfo_changed"
   sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_disconnect "fn_client_disconnect"
   sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_map_begin "fn_map_begin"
 
-  // sp_sc_func_exec from rcon/console does not forward ~args; profiles_aliases.cfg
-  // latches into _prof_cli_* then calls fn_*_entry (see README).
+  sp_sc_func_alias prof_register fn_register
+  sp_sc_func_alias prof_get_slot_by_id fn_get_slot_by_id
+  sp_sc_func_alias prof_get_slot_by_nick fn_get_slot_by_nick
+  sp_sc_func_alias prof_admin_add fn_admin_add
+  sp_sc_func_alias prof_admin_del fn_admin_del
+  sp_sc_func_alias prof_apply fn_apply
   sp_sc_func_alias prof_admin_save fn_admin_save
   sp_sc_func_alias prof_admin_load fn_admin_load
   sp_sc_func_alias prof_enforce fn_enforce
 
-  // Wait before fn_userinfo_read: userinfo_rcon.py needs time to dumpuser and
-  // write snapshot_<slot>.cfg after ext_trigger. Retries (_prof_userinfo_tries)
-  // cover shorter values; raise if snapshots are often "pending".
   sp_sc_flow_if text val #_prof_userinfo_delay == val ""
   {
     set _prof_userinfo_delay 200
@@ -261,53 +215,48 @@ function fn_guid_valid(~id)
 
 function fn_admin_add_entry()
 {
-  sp_sc_func_exec fn_admin_add_latched
+  sp_sc_func_exec fn_admin_add #_prof_cli_guid #_prof_cli_nickname
 }
 
-function fn_admin_add_latched()
+function fn_admin_add(~id, ~label)
 {
-  sp_sc_flow_if text val #_prof_cli_guid == val ""
+  sp_sc_flow_if text val #~id == val ""
   {
     echo "usage: prof_admin_add <guid24> <nickname>"
   }
   else
   {
-    sp_sc_func_exec fn_guid_valid #_prof_cli_guid
+    sp_sc_func_exec fn_guid_valid #~id
     sp_sc_flow_if text val #_prof_guid_check != val 1
     {
       echo "prof_admin_add: guid must be 24 digits (legacy 62 ok)"
     }
     else
     {
-      sp_sc_flow_if text val #_prof_cli_nickname == val ""
+      sp_sc_flow_if text val #~label == val ""
       {
         echo "prof_admin_add: nickname is required"
       }
       else
       {
-        sp_sc_func_exec fn_nickname_clean #_prof_cli_nickname
+        sp_sc_func_exec fn_nickname_clean #~label
         sp_sc_flow_if text val #_prof_nickname_clean == val ""
         {
           echo "prof_admin_add: nickname must contain letters or digits"
         }
         else
         {
-          sp_sc_cvar_copy ~id _prof_cli_guid
-          sp_sc_cvar_sset ~reg_$~id #_prof_cli_nickname
+          sp_sc_cvar_copy ~rid ~id
+          sp_sc_cvar_sset ~reg_$~rid #~label
           sp_sc_cvar_copy ~nickname_clean _prof_nickname_clean
-          sp_sc_cvar_sset ~guid_by_$~nickname_clean #_prof_cli_guid
+          sp_sc_cvar_sset ~guid_by_$~nickname_clean #~id
           sp_sc_func_exec fn_admin_save
-          sset ~msg registry guid #_prof_cli_guid nickname #_prof_cli_nickname
+          sset ~msg registry guid #~id nickname #~label
           echo $~msg
         }
       }
     }
   }
-}
-
-function fn_admin_add(~id, ~label)
-{
-  sp_sc_func_exec fn_admin_add_latched
 }
 
 function fn_admin_del_entry()

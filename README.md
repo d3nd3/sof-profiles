@@ -18,16 +18,15 @@ services — not the game server itself). Everything else is manual.
 | 2 | Symlink `user-<PORT>` → `User` | — | Port = game UDP port; triggers write under `user-<PORT>/` |
 | 3 | `mkdir -p …/sofplus/data/profiles` | — | Registry dir for `registry.cfg` |
 | 4 | Start userinfo_rcon (+ export-fire if needed) | **partial** | Copies unit files + `/etc/sof-profiles/env`; you edit env and `systemctl enable --now` |
-| 5 | Server console setup | — | Once per server **restart** — see below |
+| 5 | `sofplus-cvars.cfg` | — | Set `_sp_sv_limit_userinfo_change` to `1` — see below |
 | 6 | Verify | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
 
 **What `install.sh` does for step 4:** creates `/etc/sof-profiles/env` from the
 example (first run), installs `userinfo-rcon.service` (and `export-fire.service`
 unless `--rcon-only`), runs `daemon-reload`. It does **not** start services,
-deploy `.func` files, create the symlink, or paste console aliases.
+deploy `.func` files, or create the symlink.
 
-**Persists on disk:** `profiles.func`, `registry.cfg`, addon files.  
-**Redo each server restart:** console setup (step 5). SoFplus does not save `sp_sc_alias` to disk.  
+**Persists on disk:** `profiles.func`, `registry.cfg`, `sofplus-cvars.cfg`, addon files.  
 **Redo if host reboots:** step 4 services (if enabled with `systemctl enable`).
 
 ### systemd (recommended)
@@ -67,56 +66,26 @@ python3 /path/to/userinfo_rcon.py
 
 Snapshots land in `<SoF user>/sofplus/data/userinfo/snapshot_<slot>.cfg`.
 
-### Server console setup (after each restart)
+### `sofplus-cvars.cfg`
 
-Open the **server console** or connect via **rcon** (in-game `rcon <password> …`, or any
-rcon client). Run the following there. This is not a shell script — each line is a
-command the **game server** must execute.
-
-**What loads automatically**
-
-When the server starts, SoFplus loads `profiles.func` from `sofplus/addons/`. That
-registers hooks and three commands: `prof_admin_save`, `prof_admin_load`, `prof_enforce`.
-
-**What you must run manually**
-
-Commands like `prof_admin_add` and `prof_apply` live in `profiles_aliases.cfg`. That
-file is **not** exec'd by the game. Copy its entire contents into the server
-console/rcon and press Enter (one block paste is fine).
-
-**1. Recommended cvar**
+Edit `<SoF user>/sofplus-cvars.cfg` (e.g. `User/sofplus-cvars.cfg`) and set:
 
 ```text
 set _sp_sv_limit_userinfo_change 1
 ```
 
-**2. Optional `swap` shortcut** (handy for testing team-menu collapse)
+Reduces userinfo feedback loops. This file is loaded on server start — no console
+step each restart.
 
-```text
-sp_sc_alias swap sp_sv_client_swap #{1}
-```
-
-**3. Register `prof_*` commands** — paste all lines from `profiles_aliases.cfg`:
-
-```text
-sp_sc_alias prof_register 'set _prof_cli_slot #{1}; sp_sc_func_exec fn_register_entry'
-sp_sc_alias prof_get_slot_by_id 'set _prof_cli_guid #{1}; sp_sc_func_exec fn_get_slot_by_id_entry'
-…
-```
-
-(The repo file has the full list; paste the whole file.)
-
-After this you can type e.g. `prof_admin_add <guid> <nickname>` in console/rcon.
+When the server boots, SoFplus also loads `profiles.func` from `sofplus/addons/`,
+which registers all `prof_*` commands automatically.
 
 **If you edited `profiles.func` without restarting the server**
 
 ```text
 sp_sc_func_load_file sofplus/addons/profiles.func
-sp_sc_func_exec fn_profiles_init
+sp_sc_func_exec profiles_init
 ```
-
-You still need step 3 above after a full server restart — only `profiles.func`
-reload is covered by the two lines here.
 
 ### Verify
 
@@ -124,22 +93,23 @@ reload is covered by the two lines here.
 2. `prof_admin_add <guid> <nickname>`
 3. Connect client → `prof_apply 0 <guid>`
 4. `prof_enforce` — slot line should show `ok`
-5. `swap 0` — auto-restore or run `prof_enforce` again; snapshot should show full guid+team
+5. Team-menu collapse test — see **Rcon testing** (`swap` alias) or use `sp_sv_client_swap 0`
 
 If `pending` and no `snapshot_*.cfg`, check export-fire, userinfo-rcon, and `RCON_PASSWORD`.
 
 ## Commands
 
-Run in server console or rcon. Commands marked *paste* need `profiles_aliases.cfg`
-run once after each server restart; others load from `profiles.func` on boot.
+Run in server console or rcon. All `prof_*` commands register on boot via
+`profiles.func` (`sp_sc_func_alias`).
 
 | Command | Args | What it does |
 |---------|------|--------------|
-| `prof_admin_add` *paste* | `<guid> <nickname>` | Register; auto-saves |
-| `prof_admin_del` *paste* | `<guid> <nickname>` | Remove by guid **or** nickname (other `""`) |
-| `prof_apply` *paste* | `<slot> <guid>` | Push registered guid to slot |
+| `prof_admin_add` | `<guid> <nickname>` | Add to roster; auto-saves |
+| `prof_admin_del` | `<guid> <nickname>` | Remove by guid **or** nickname (other `""`) |
+| `prof_apply` | `<slot> <guid>` | Push roster guid to slot |
 | `prof_enforce` | — | Health-check every connected player — see below |
-| `prof_get_slot_by_id` / `by_nick` *paste* | guid / nickname | → `_prof_found_slot` |
+| `prof_get_slot_by_id` / `by_nick` | guid / nickname | → `_prof_found_slot` |
+| `prof_register` | `<slot>` | Request snapshot for slot |
 | `prof_admin_save` / `load` | — | Save/load `registry.cfg` |
 
 ### `prof_enforce` — check all players and fix lost guids
@@ -274,12 +244,23 @@ Watches export-fire `userinfo` events → `rcon dumpuser <slot>` →
 
 ## Rcon testing
 
-Not needed for normal server operation. Use this when developing or debugging
-over rcon before `profiles_aliases.cfg` is pasted, or when your rcon client
-makes multi-argument `prof_*` commands awkward.
+Not needed for normal server operation. Use when testing over rcon if your client
+cannot pass multi-argument `prof_*` commands reliably.
 
-Each `prof_*` alias is a thin wrapper: stash args in `_prof_cli_*` cvars, then
-call `fn_*_entry`. You can do that manually:
+**Load `profiles_aliases.cfg`** (latch + `fn_*_entry` wrappers) in server console:
+
+```text
+sp_sc_exec_file /path/to/profiles_aliases.cfg
+```
+
+**Team-menu collapse test** — optional shortcut after the above:
+
+```text
+sp_sc_alias swap sp_sv_client_swap #{1}
+swap 0
+```
+
+**Or** set `_prof_cli_*` and call an entry function directly:
 
 ```text
 set _prof_cli_guid 602380633711624767525303
@@ -287,5 +268,4 @@ set _prof_cli_nickname slot0test
 sp_sc_func_exec fn_admin_add_entry
 ```
 
-Same as `prof_admin_add`. See `profiles_aliases.cfg` for the `_prof_cli_*` cvars
-each entry function expects (`fn_apply_entry`, `fn_admin_del_entry`, etc.).
+See `profiles_aliases.cfg` for which `_prof_cli_*` cvars each `fn_*_entry` expects.
