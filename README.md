@@ -21,15 +21,12 @@ services — not the game server itself). Everything else is manual.
 | 5 | `sofplus-cvars.cfg` | — | Set `_sp_sv_limit_userinfo_change` to `1` — see below |
 | 6 | Verify | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
 
-**What `install.sh` does for step 4:** creates `/etc/sof-profiles/env` from the
-example (first run), installs `userinfo-rcon.service` (and `export-fire.service`
-unless `--rcon-only`), runs `daemon-reload`. It does **not** start services,
-deploy `.func` files, or create the symlink.
-
-**Persists on disk:** `profiles.func`, `registry.cfg`, `sofplus-cvars.cfg`, addon files.  
-**Redo if host reboots:** step 4 services (if enabled with `systemctl enable`).
+**Persists on disk:** `profiles.func`, `registry.cfg`, `sofplus-cvars.cfg`, addon files.
 
 ### systemd (recommended)
+
+Use `systemctl enable --now` when installing so `userinfo-rcon` (and `export-fire`,
+if applicable) starts again after a host reboot.
 
 **export-fire already running** (another feature on the same host):
 
