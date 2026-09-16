@@ -542,7 +542,7 @@ function fn_try_restore_live(~slot)
   }
 }
 
-// Push stash+current_team when live userinfo != stash+team (dedup on client value).
+// Re-push remembered_guid+team once per target (~full dedup via _prof_restored_<slot>).
 function fn_restore_stash_push(~slot)
 {
   sp_sc_func_exec fn_live_team_bit #~slot
@@ -578,17 +578,26 @@ function fn_restore_stash_push(~slot)
   sp_sc_flow_if text val #~st != val ""
   {
     sp_sc_cvar_sset ~full #~st #~team
-    sp_sc_flow_if text val #_prof_guid_valid == val 1
+    sp_sc_flow_if text cvar _prof_restored_$~slot == val #~full
     {
-      sp_sc_cvar_copy ~cur _prof_userinfo_team_red_blue
-      sp_sc_flow_if text cvar ~cur != val #~full
-      {
-        sp_sc_func_exec fn_restore_stash_do #~slot #~team #~full
-      }
     }
     else
     {
-      sp_sc_func_exec fn_restore_stash_do #~slot #~team #~full
+      sp_sc_flow_if text val #_prof_guid_valid == val 1
+      {
+        sp_sc_flow_if text cvar _prof_userinfo_team_red_blue == val #~full
+        {
+          set _prof_restored_$~slot #~full
+        }
+        else
+        {
+          sp_sc_func_exec fn_restore_stash_do #~slot #~team #~full
+        }
+      }
+      else
+      {
+        sp_sc_func_exec fn_restore_stash_do #~slot #~team #~full
+      }
     }
   }
 }
