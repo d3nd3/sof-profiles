@@ -902,7 +902,8 @@ function fn_push_checked(~slot, ~team)
   }
 }
 
-// Audit all slots (per-slot lines) and stufftext-fix registered players with wrong team_red_blue.
+// Health-check every connected slot via snapshot_<slot>.cfg; stufftext-fix registered
+// players whose team_red_blue collapsed to 0/1. Echo ok/guest/wrong/pending per slot.
 function fn_enforce()
 {
   set ~nok 0

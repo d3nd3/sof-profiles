@@ -208,9 +208,39 @@ run once after each server restart; others load from `profiles.func` on boot.
 | `prof_admin_add` *paste* | `<guid> <nickname>` | Register; auto-saves |
 | `prof_admin_del` *paste* | `<guid> <nickname>` | Remove by guid **or** nickname (other `""`) |
 | `prof_apply` *paste* | `<slot> <guid>` | Push registered guid to slot |
-| `prof_enforce` | — | Audit all slots (per-slot lines) and stufftext-fix wrong `team_red_blue` |
+| `prof_enforce` | — | Health-check every connected player — see below |
 | `prof_get_slot_by_id` / `by_nick` *paste* | guid / nickname | → `_prof_found_slot` |
 | `prof_admin_save` / `load` | — | Save/load `registry.cfg` |
+
+### `prof_enforce` — check all players and fix lost guids
+
+Walks every **connected, non-spectator** slot. For each one it reads the latest
+`snapshot_<slot>.cfg` (from `dumpuser`) and compares `team_red_blue` to the admin
+registry.
+
+**Per-slot line** (one of):
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| `ok` | `team_red_blue` contains a registered guid | None — player identity looks correct |
+| `guest` | Guid in userinfo is missing or not in registry | None — unregistered player |
+| `wrong` | Registered player, but userinfo collapsed to bare `0`/`1` (team menu, swap, etc.) | **Fix:** stufftext `remembered_guid + team_bit` back onto the client |
+| `pending` | No snapshot file yet | Requests a new snapshot (needs export-fire + userinfo_rcon) |
+
+**Summary line** at the end, e.g.:
+
+```text
+enforce: 2 ok, 1 wrong, 1 pushed, 0 manual, 0 guests, 0 pending
+```
+
+- `pushed` — `wrong` slots that were stufftext-fixed
+- `manual` — fix was printed but not sent (`_prof_use_stufftext 0`)
+- `guests` / `pending` — counts from the table above
+
+**When to run it:** after `prof_apply`, after a `swap` test, when you suspect a
+registered player lost their guid, or any time you want a status report. Automatic
+restore on userinfo change usually handles collapse without this, but `prof_enforce`
+is the manual “scan everyone and repair” command.
 
 **Rcon latch:**
 
