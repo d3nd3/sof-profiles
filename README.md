@@ -26,13 +26,14 @@ services — not the game server itself). Everything else is manual.
 ### systemd (recommended)
 
 The install script only copies unit files — it does **not** start the Python
-processes. The `systemctl enable --now …` lines below do two things:
+processes. `systemctl enable --now` is the same as `enable` plus `start` in one
+command. The lines below:
 
-- **`--now`** — start `userinfo-rcon` / `export-fire` immediately (profiles need
-  these running while the game server is up).
-- **`enable`** — tell systemd to start them automatically whenever the **host**
-  reboots. Without `enable`, a reboot stops the processes and snapshots break until
-  you start them again by hand.
+- **`start`** (`--now`) — run `userinfo-rcon` / `export-fire` immediately (profiles
+  need these while the game server is up).
+- **`enable`** — start them automatically whenever the **host** reboots. Without
+  `enable`, a reboot stops the processes and snapshots break until you
+  `systemctl start` them again by hand.
 
 **export-fire already running** (another feature on the same host):
 
