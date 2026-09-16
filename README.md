@@ -19,14 +19,20 @@ services — not the game server itself). Everything else is manual.
 | 3 | `mkdir -p …/sofplus/data/profiles` | — | Registry dir for `registry.cfg` |
 | 4 | Start userinfo_rcon (+ export-fire if needed) | **partial** | Copies unit files + `/etc/sof-profiles/env`; you edit env and `systemctl enable --now` |
 | 5 | `sofplus-cvars.cfg` | — | Set `_sp_sv_limit_userinfo_change` to `1` — see below |
-| 6 | Verify | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
+| 6 | Debug-Stress-Testing | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
 
 **Persists on disk:** `profiles.func`, `registry.cfg`, `sofplus-cvars.cfg`, addon files.
 
 ### systemd (recommended)
 
-Use `systemctl enable --now` when installing so `userinfo-rcon` (and `export-fire`,
-if applicable) starts again after a host reboot.
+The install script only copies unit files — it does **not** start the Python
+processes. The `systemctl enable --now …` lines below do two things:
+
+- **`--now`** — start `userinfo-rcon` / `export-fire` immediately (profiles need
+  these running while the game server is up).
+- **`enable`** — tell systemd to start them automatically whenever the **host**
+  reboots. Without `enable`, a reboot stops the processes and snapshots break until
+  you start them again by hand.
 
 **export-fire already running** (another feature on the same host):
 
@@ -84,7 +90,7 @@ sp_sc_func_load_file sofplus/addons/profiles.func
 sp_sc_func_exec profiles_init
 ```
 
-### Verify
+### Debug-Stress-Testing
 
 1. `python3 userinfo_rcon.py --mint`
 2. `prof_admin_add <guid> <nickname>`
