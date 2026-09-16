@@ -176,7 +176,7 @@ registry.
 |--------|---------|--------|
 | `ok` | Roster player's guid is present in `team_red_blue` | None — identity looks correct |
 | `guest` | Not on the roster (no guid, or guid unknown to admin) | None |
-| `wrong` | Roster player, but userinfo collapsed to bare `0`/`1` (team menu, swap, etc.) | **Fix:** stufftext `remembered_guid + team_bit` back onto the client |
+| `wrong` | Roster player, but userinfo collapsed to bare `0`/`1` (team menu, swap, etc.) | **Fix:** stufftext `blue-/red-<guid>-<bit>` back onto the client |
 | `pending` | No snapshot file yet | Requests a new snapshot (needs export-fire + userinfo_rcon) |
 
 **Summary line** at the end, e.g.:
@@ -205,7 +205,8 @@ Admin registry (disk)                         Per-slot runtime (memory)
         │                                              │
         └──────────── fn_reg_lookup ─────────────────┘
 
-team_red_blue = <guid digits><0|1>   — or bare 0/1 after team menu / swap
+team_red_blue = blue-<guid>-0 | red-<guid>-1   — or bare 0/1 after team menu / swap
+              (legacy all-digit <guid><0|1> still accepted on read)
 ```
 
 ### Snapshots
@@ -250,20 +251,20 @@ from **who this slot is for the whole connection**:
 | `_prof_guid_<slot>` | After each snapshot whose dumpuser `team_red_blue` parses as guid+bit | Mirror of last good dumpuser read |
 | `_prof_remembered_guid_<slot>` | Once, on first valid guid (then kept until disconnect) | Anchor used to rebuild `team_red_blue` after collapse |
 
-**Normal play** — client sends `6023806337116247675253030` (guid + blue). Both
-cvars hold `602380633711624767525303`.
+**Normal play** — client sends e.g. `blue-602380633711624767525303-0`. Both guid
+cvars hold `602380633711624767525303` (digits only, no color prefix).
 
 **After team menu / swap** — engine collapses userinfo to bare `0` or `1`. Snapshot
 is no longer parseable as a guid (`_prof_guid_valid = 0`); `_prof_guid_<slot>` is
 cleared or stale. `_prof_remembered_guid_<slot>` still holds
 `602380633711624767525303`, so `fn_try_restore_live` / `fn_maybe_fixup` can
-stufftext `remembered_guid + current_team_bit` back.
+stufftext `blue-<remembered_guid>-0` or `red-<remembered_guid>-1` back.
 
 Without two variables we would lose the guid the moment userinfo collapsed.
 
 | Term | Meaning |
 |------|---------|
-| `guid` | 24-digit id in `team_red_blue` (bearer token) |
+| `guid` | 24-digit id inside `team_red_blue` (bearer token; not the color prefix) |
 | `nickname` | Your label for that player in the registry |
 | `nickname_clean` | `nickname` sanitised to `a-z0-9` (reverse lookup key) |
 | **Roster player** | Someone you added with `prof_admin_add` — the server knows their guid and admin nickname. Anyone else connected is a **guest**. |

@@ -341,6 +341,25 @@ function fn_offer_key(~slot, ~full)
   }
 }
 
+function fn_build_team_red_blue(~guid, ~team)
+{
+  sp_sc_flow_if text val #~team == val 0
+  {
+    sp_sc_cvar_sset _prof_trb_value blue- #~guid -0
+  }
+  else
+  {
+    sp_sc_flow_if text val #~team == val 1
+    {
+      sp_sc_cvar_sset _prof_trb_value red- #~guid -1
+    }
+    else
+    {
+      zero _prof_trb_value
+    }
+  }
+}
+
 function fn_offer_id(~slot, ~idpart)
 {
   sp_sc_cvar_copy ~team _prof_team
@@ -357,7 +376,8 @@ function fn_offer_id(~slot, ~idpart)
       set ~team 0
     }
   }
-  sp_sc_cvar_sset ~full #~idpart #~team
+  sp_sc_func_exec fn_build_team_red_blue #~idpart #~team
+  sp_sc_cvar_copy ~full _prof_trb_value
   sp_sc_func_exec fn_offer_key #~slot #~full
 }
 
@@ -444,7 +464,8 @@ function fn_restore_stash_push(~slot)
   sp_sc_cvar_copy ~st _prof_remembered_guid_$~slot
   sp_sc_flow_if text val #~st != val ""
   {
-    sp_sc_cvar_sset ~full #~st #~team
+    sp_sc_func_exec fn_build_team_red_blue #~st #~team
+    sp_sc_cvar_copy ~full _prof_trb_value
     sp_sc_flow_if text cvar _prof_restored_$~slot == val #~full
     {
     }
@@ -725,7 +746,8 @@ function fn_apply(~slot, ~id)
 function fn_push_slot(~slot)
 {
   sp_sc_cvar_copy ~team _prof_team_$~slot
-  sp_sc_cvar_sset ~full #_prof_push_guid #~team
+  sp_sc_func_exec fn_build_team_red_blue #_prof_push_guid #~team
+  sp_sc_cvar_copy ~full _prof_trb_value
   sp_sc_cvar_copy _prof_remembered_guid_$~slot _prof_push_guid
   sp_sc_cvar_copy _prof_guid_$~slot _prof_push_guid
   set _prof_is_registered_$~slot 1

@@ -125,20 +125,41 @@ def sanitize_value(value: str) -> str:
     return value.replace("\r", "").replace("\n", "").replace('"', "'")
 
 
-def split_identity(value: str):
-    """Split a team_red_blue value into (identity, team, valid).
+TRB_RE = re.compile(r"^(blue|red)-(\d+)-(0|1)$", re.IGNORECASE)
 
-    Valid identity form: all digits, >= 2 chars, last char 0/1 (the team
-    bit the game reads via atoi). ``team`` mirrors the game (atoi low bit)
-    for any all-digit value -- so legacy single-digit "0"/"1" still yield
-    their team -- and is -1 otherwise. Trust model: trust-on-first-use;
-    whoever controls the client userinfo owns the binding. New mints use
-    IDENTITY_DIGITS (24); legacy 62-digit registry keys still parse.
+
+def format_team_red_blue(identity: str, team: int) -> str:
+    """Human-readable team_red_blue: blue-{guid}-0 or red-{guid}-1."""
+    color = "blue" if (team & 1) == 0 else "red"
+    return "%s-%s-%d" % (color, identity, team & 1)
+
+
+def split_identity(value: str):
+    """Split team_red_blue into (identity_digits, team, valid).
+
+    Preferred: ``blue|red-<guid>-<0|1>`` (readable in client config.cfg).
+    Legacy: all-digit ``<guid><0|1>`` (24- or 62-digit guid). Collapsed
+    ``0``/``1`` alone are invalid identity but yield team 0/1.
     """
-    if value and re.fullmatch(r"[0-9]+", value):
+    if not value:
+        return ("", -1, False)
+    m = TRB_RE.match(value.strip())
+    if m:
+        color, identity, bit = m.group(1).lower(), m.group(2), int(m.group(3))
+        team = bit & 1
+        if color == "blue" and team != 0:
+            return ("", team, False)
+        if color == "red" and team != 1:
+            return ("", team, False)
+        if identity.isdigit() and len(identity) in (IDENTITY_DIGITS, LEGACY_IDENTITY_DIGITS):
+            return (identity, team, True)
+        return ("", team, False)
+    if re.fullmatch(r"[0-9]+", value):
         team = int(value[-1]) & 1
         if len(value) >= 2 and value[-1] in ("0", "1"):
-            return (value[:-1], team, True)
+            identity = value[:-1]
+            if len(identity) in (IDENTITY_DIGITS, LEGACY_IDENTITY_DIGITS):
+                return (identity, team, True)
         return ("", team, False)
     return ("", -1, False)
 
@@ -269,7 +290,7 @@ def handle_event(event: dict, cfg: Config) -> Optional[str]:
         "_prof_guid": identity,
         "_prof_team": str(team),
         # Fresh candidate for unregistered players; the .func offers it
-        # once for `team_red_blue "<id><team>"`. Minted even for
+        # once for `team_red_blue "blue-<id>-0"` etc. Minted even for
         # garbage values (team digit resolved script-side).
         "_prof_guid_new": "" if valid else mint_identity(),
     }
