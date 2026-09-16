@@ -9,18 +9,26 @@ Optional **systemd** units in `systemd/` wrap the two Python services.
 
 ### Checklist
 
-| # | What | Notes |
-|---|------|--------|
-| 1 | Deploy `profiles.func`, `ext_trigger.func` | `sofplus/addons/` (names not starting with `-`) |
-| 2 | Symlink `user-<PORT>` → `User` | Port = game UDP port; triggers write under `user-<PORT>/` |
-| 3 | `mkdir -p …/sofplus/data/profiles` | Registry dir for `registry.cfg` |
-| 4 | Start userinfo_rcon (export-fire if needed) | `systemd/install.sh` or manual (below) |
-| 5 | Server console setup | Once per server **restart** — see below |
-| 6 | Verify | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
+`systemd/install.sh` only helps with **step 4** (and only the host-side Python
+services — not the game server itself). Everything else is manual.
+
+| # | What | `install.sh` | Notes |
+|---|------|--------------|--------|
+| 1 | Deploy `profiles.func`, `ext_trigger.func` | — | `sofplus/addons/` (names not starting with `-`) |
+| 2 | Symlink `user-<PORT>` → `User` | — | Port = game UDP port; triggers write under `user-<PORT>/` |
+| 3 | `mkdir -p …/sofplus/data/profiles` | — | Registry dir for `registry.cfg` |
+| 4 | Start userinfo_rcon (+ export-fire if needed) | **partial** | Copies unit files + `/etc/sof-profiles/env`; you edit env and `systemctl enable --now` |
+| 5 | Server console setup | — | Once per server **restart** — see below |
+| 6 | Verify | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
+
+**What `install.sh` does for step 4:** creates `/etc/sof-profiles/env` from the
+example (first run), installs `userinfo-rcon.service` (and `export-fire.service`
+unless `--rcon-only`), runs `daemon-reload`. It does **not** start services,
+deploy `.func` files, create the symlink, or paste console aliases.
 
 **Persists on disk:** `profiles.func`, `registry.cfg`, addon files.  
 **Redo each server restart:** console setup (step 5). SoFplus does not save `sp_sc_alias` to disk.  
-**Redo if host reboots:** userinfo_rcon (and export-fire only if you manage it here).
+**Redo if host reboots:** step 4 services (if enabled with `systemctl enable`).
 
 ### systemd (recommended)
 
