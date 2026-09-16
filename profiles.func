@@ -11,7 +11,7 @@
 // Authority model: the ADMIN registers identities with a required label.
 // Client userinfo "name" is never read for matching. Recognition is
 // purely by the identity digits in team_red_blue. Admin labels are
-// metadata for humans and prof_find_by_name (registry index only).
+// metadata for humans and prof_get_slot_by_nick (registry index only).
 //
 // Registry (profiles/registry.cfg) — persisted via ~ locals + sp_sc_cvar_save
 // (same pattern as ~user_* in spf_sv_rcon), not _prof_reg_* globals:
@@ -56,12 +56,14 @@ function fn_profiles_init()
   // latches into _prof_cli_* then calls fn_*_entry (see README).
   sp_sc_func_alias prof_admin_save fn_admin_save
   sp_sc_func_alias prof_admin_load fn_admin_load
-  sp_sc_func_alias prof_audit fn_audit
   sp_sc_func_alias prof_enforce fn_enforce
 
+  // Wait before fn_userinfo_read: userinfo_rcon.py needs time to dumpuser and
+  // write snapshot_<slot>.cfg after ext_trigger. Retries (_prof_userinfo_tries)
+  // cover shorter values; raise if snapshots are often "pending".
   sp_sc_flow_if text val #_prof_userinfo_delay == val ""
   {
-    set _prof_userinfo_delay 1000
+    set _prof_userinfo_delay 200
   }
   sp_sc_flow_if text val #_prof_userinfo_tries == val ""
   {
@@ -124,16 +126,6 @@ function fn_userinfo_read_deferred()
 {
   sp_sc_cvar_copy ~slot _prof_read_slot
   sp_sc_func_exec fn_userinfo_read #~slot
-  sp_sc_func_exec fn_enforce_slot #~slot
-}
-
-function fn_enforce_slot(~slot)
-{
-  sp_sc_func_exec fn_audit_slot #~slot
-  sp_sc_flow_if text val #_prof_audit_rc == val wrong
-  {
-    sp_sc_func_exec fn_restore_stash_push #~slot
-  }
 }
 
 function fn_request_snapshot(~slot)
@@ -172,12 +164,12 @@ function fn_register(~slot)
   }
 }
 
-function fn_find_by_id_entry()
+function fn_get_slot_by_id_entry()
 {
-  sp_sc_func_exec fn_find_by_id #_prof_cli_guid
+  sp_sc_func_exec fn_get_slot_by_id #_prof_cli_guid
 }
 
-function fn_find_by_id(~id)
+function fn_get_slot_by_id(~id)
 {
   set _prof_found_slot -1
   sp_sc_flow_if text val #~id != val ""
@@ -194,13 +186,13 @@ function fn_find_by_id(~id)
   }
 }
 
-function fn_find_by_name_entry()
+function fn_get_slot_by_nick_entry()
 {
-  sp_sc_func_exec fn_find_by_name #_prof_cli_nickname
+  sp_sc_func_exec fn_get_slot_by_nick #_prof_cli_nickname
 }
 
-// Find a connected slot by admin registry label (not client userinfo name).
-function fn_find_by_name(~label)
+// Connected slot by registry nickname (not client userinfo name).
+function fn_get_slot_by_nick(~label)
 {
   set _prof_found_slot -1
   sp_sc_flow_if text val #~label != val ""
@@ -210,7 +202,7 @@ function fn_find_by_name(~label)
     sp_sc_flow_if text cvar ~guid_by_$~nickname_clean != val ""
     {
       sp_sc_cvar_copy ~id ~guid_by_$~nickname_clean
-      sp_sc_func_exec fn_find_by_id #~id
+      sp_sc_func_exec fn_get_slot_by_id #~id
     }
   }
 }
@@ -779,60 +771,6 @@ function fn_audit_slot(~slot)
   }
 }
 
-function fn_audit()
-{
-  set ~nok 0
-  set ~nbad 0
-  set ~nguest 0
-  set ~npending 0
-  set ~i 0
-  sp_sc_flow_while number cvar ~i < cvar maxclients
-  {
-    sp_sc_func_exec fn_slot_info #~i
-    sp_sc_flow_if number cvar _prof_ps_present == val 1
-    {
-      sp_sc_flow_if text cvar _prof_ps_spec == val 0
-      {
-        sp_sc_func_exec fn_audit_slot #~i
-        sp_sc_flow_if text val #_prof_audit_rc == val ok
-        {
-          sset ~msg slot #~i ok guid #_prof_guid nickname #_prof_lookup_nickname
-          echo $~msg
-          add ~nok 1
-        }
-        else
-        {
-          sp_sc_flow_if text val #_prof_audit_rc == val wrong
-          {
-            sset ~msg slot #~i wrong: #_prof_userinfo_team_red_blue remembered #_prof_remembered_guid_$~i
-            echo $~msg
-            add ~nbad 1
-          }
-          else
-          {
-            sp_sc_flow_if text val #_prof_audit_rc == val guest
-            {
-              sset ~msg slot #~i guest: #_prof_userinfo_team_red_blue
-              echo $~msg
-              add ~nguest 1
-            }
-            else
-            {
-              sset ~msg slot #~i pending: no snapshot, requesting
-              echo $~msg
-              sp_sc_func_exec fn_request_snapshot #~i
-              add ~npending 1
-            }
-          }
-        }
-      }
-    }
-    add ~i 1
-  }
-  sset ~msg audit: #~nok ok, #~nbad wrong, #~nguest guests, #~npending pending
-  echo $~msg
-}
-
 function fn_apply_entry()
 {
   sp_sc_func_exec fn_apply #_prof_cli_slot #_prof_cli_guid
@@ -964,9 +902,11 @@ function fn_push_checked(~slot, ~team)
   }
 }
 
+// Audit all slots (per-slot lines) and stufftext-fix registered players with wrong team_red_blue.
 function fn_enforce()
 {
   set ~nok 0
+  set ~nbad 0
   set ~nfix 0
   set ~nmanual 0
   set ~nguest 0
@@ -983,12 +923,16 @@ function fn_enforce()
         sp_sc_flow_if text val #_prof_audit_rc == val ok
         {
           set _prof_is_registered_$~i 1
+          sset ~msg slot #~i ok guid #_prof_guid nickname #_prof_lookup_nickname
+          echo $~msg
           add ~nok 1
         }
         else
         {
           sp_sc_flow_if text val #_prof_audit_rc == val wrong
           {
+            sset ~msg slot #~i wrong: #_prof_userinfo_team_red_blue remembered #_prof_remembered_guid_$~i
+            echo $~msg
             sp_sc_func_exec fn_restore_stash_push #~i
             sp_sc_flow_if text val #_prof_push_rc == val pushed
             {
@@ -1006,15 +950,20 @@ function fn_enforce()
                 add ~npending 1
               }
             }
+            add ~nbad 1
           }
           else
           {
             sp_sc_flow_if text val #_prof_audit_rc == val guest
             {
+              sset ~msg slot #~i guest: #_prof_userinfo_team_red_blue
+              echo $~msg
               add ~nguest 1
             }
             else
             {
+              sset ~msg slot #~i pending: no snapshot, requesting
+              echo $~msg
               sp_sc_func_exec fn_request_snapshot #~i
               add ~npending 1
             }
@@ -1024,6 +973,6 @@ function fn_enforce()
     }
     add ~i 1
   }
-  sset ~msg enforce: #~nok ok, #~nfix pushed, #~nmanual manual, #~nguest guests, #~npending pending
+  sset ~msg enforce: #~nok ok, #~nbad wrong, #~nfix pushed, #~nmanual manual, #~nguest guests, #~npending pending
   echo $~msg
 }

@@ -1,0 +1,13 @@
+[Unit]
+Description=SoF export-fire (profiles userinfo triggers)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sof-profiles/env
+ExecStart=/bin/sh -c 'exec python3 "$SOF_EXPORT_FIRE" --root "$SOF_USER_ROOT" --serve 127.0.0.1:8765'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=SoF userinfo rcon snapshotter (profiles)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sof-profiles/env
+Environment=EXPORT_FIRE_HOST=127.0.0.1
+Environment=EXPORT_FIRE_PORT=8765
+ExecStart=/bin/sh -c 'exec python3 "$SOF_PROFILES/userinfo_rcon.py"'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
