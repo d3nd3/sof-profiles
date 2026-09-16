@@ -9,7 +9,7 @@ Admin registry (disk)                         Per-slot runtime (memory)
 ~reg_<guid> → nickname                        _prof_remembered_guid_<slot>  anchor (survives collapse)
 ~guid_by_<nickname_clean> → guid               _prof_guid_<slot>             last good snapshot
                                               _prof_nickname_<slot>         registry nickname
-                                              _prof_is_registered_<slot>    1 = registered player
+                                              _prof_is_registered_<slot>    1 = roster player on this slot
         │                                              │
         └──────────── fn_reg_lookup ─────────────────┘
 
@@ -74,9 +74,10 @@ Without two variables we would lose the guid the moment userinfo collapsed.
 | `guid` | 24-digit id in `team_red_blue` (bearer token) |
 | `nickname` | Your label for that player in the registry |
 | `nickname_clean` | `nickname` sanitised to `a-z0-9` (reverse lookup key) |
-| `_prof_is_registered_<slot>` | `1` when this slot is a known registered player |
+| **Roster player** | Someone you added with `prof_admin_add` — the server knows their guid and admin nickname. Anyone else connected is a **guest**. |
+| `_prof_is_registered_<slot>` | `1` when this **slot** is currently a roster player (guid applied or confirmed via snapshot). Cleared on disconnect. |
 
-**Flow:** register → apply → userinfo change → dumpuser snapshot → lookup
+**Flow:** `prof_admin_add` → `prof_apply` → userinfo change → dumpuser snapshot → lookup
 `~reg_<guid>` → bind or re-push `_prof_remembered_guid_` on collapse. Mint:
 `python3 userinfo_rcon.py --mint`.
 
@@ -222,9 +223,9 @@ registry.
 
 | Status | Meaning | Action |
 |--------|---------|--------|
-| `ok` | `team_red_blue` contains a registered guid | None — player identity looks correct |
-| `guest` | Guid in userinfo is missing or not in registry | None — unregistered player |
-| `wrong` | Registered player, but userinfo collapsed to bare `0`/`1` (team menu, swap, etc.) | **Fix:** stufftext `remembered_guid + team_bit` back onto the client |
+| `ok` | Roster player's guid is present in `team_red_blue` | None — identity looks correct |
+| `guest` | Not on the roster (no guid, or guid unknown to admin) | None |
+| `wrong` | Roster player, but userinfo collapsed to bare `0`/`1` (team menu, swap, etc.) | **Fix:** stufftext `remembered_guid + team_bit` back onto the client |
 | `pending` | No snapshot file yet | Requests a new snapshot (needs export-fire + userinfo_rcon) |
 
 **Summary line** at the end, e.g.:
@@ -238,17 +239,35 @@ enforce: 2 ok, 1 wrong, 1 pushed, 0 manual, 0 guests, 0 pending
 - `guests` / `pending` — counts from the table above
 
 **When to run it:** after `prof_apply`, after a `swap` test, when you suspect a
-registered player lost their guid, or any time you want a status report. Automatic
+roster player lost their guid, or any time you want a status report. Automatic
 restore on userinfo change usually handles collapse without this, but `prof_enforce`
 is the manual “scan everyone and repair” command.
 
-**Rcon latch:**
+### Calling commands with awkward arguments
+
+Most of the time you use the short forms from `profiles_aliases.cfg`, e.g.:
+
+```text
+prof_admin_add 602380633711624767525303 slot0test
+```
+
+Under the hood each `prof_*` alias does two steps: copy your arguments into
+temporary cvars (`_prof_cli_guid`, `_prof_cli_nickname`, `_prof_cli_slot`), then
+call an `fn_*_entry` function that reads those cvars. SoFplus functions take
+numeric args easily but long guid strings are passed this way instead.
+
+If the alias is missing (forgot to paste `profiles_aliases.cfg`) or you are
+scripting from rcon, do the same steps yourself:
 
 ```text
 set _prof_cli_guid 602380633711624767525303
 set _prof_cli_nickname slot0test
 sp_sc_func_exec fn_admin_add_entry
 ```
+
+That is equivalent to `prof_admin_add`. Other entry points:
+`fn_admin_del_entry`, `fn_apply_entry`, `fn_get_slot_by_id_entry`, etc. — see
+`profiles_aliases.cfg` for which `_prof_cli_*` cvars each one expects.
 
 ## State
 
