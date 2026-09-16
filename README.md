@@ -243,32 +243,6 @@ roster player lost their guid, or any time you want a status report. Automatic
 restore on userinfo change usually handles collapse without this, but `prof_enforce`
 is the manual “scan everyone and repair” command.
 
-### Calling commands with awkward arguments
-
-Most of the time you use the short forms from `profiles_aliases.cfg`, e.g.:
-
-```text
-prof_admin_add 602380633711624767525303 slot0test
-```
-
-Under the hood each `prof_*` alias does two steps: copy your arguments into
-temporary cvars (`_prof_cli_guid`, `_prof_cli_nickname`, `_prof_cli_slot`), then
-call an `fn_*_entry` function that reads those cvars. SoFplus functions take
-numeric args easily but long guid strings are passed this way instead.
-
-If the alias is missing (forgot to paste `profiles_aliases.cfg`) or you are
-scripting from rcon, do the same steps yourself:
-
-```text
-set _prof_cli_guid 602380633711624767525303
-set _prof_cli_nickname slot0test
-sp_sc_func_exec fn_admin_add_entry
-```
-
-That is equivalent to `prof_admin_add`. Other entry points:
-`fn_admin_del_entry`, `fn_apply_entry`, `fn_get_slot_by_id_entry`, etc. — see
-`profiles_aliases.cfg` for which `_prof_cli_*` cvars each one expects.
-
 ## State
 
 **Registry** (`profiles/registry.cfg`): `~reg_<guid>` → nickname,
@@ -294,3 +268,21 @@ Legacy `_prof_reg_*`, `_prof_nick_*`, `~nick_*`, `~id_by_label_*` → `~reg_*` /
 Watches export-fire `userinfo` events → `rcon dumpuser <slot>` →
 `snapshot_<slot>.cfg`. Env: `RCON_PASSWORD` (required), `EXPORT_FIRE_HOST`/`PORT`,
 `RCON_HOST`/`PORT`, `VERBOSE`.
+
+## Rcon testing
+
+Not needed for normal server operation. Use this when developing or debugging
+over rcon before `profiles_aliases.cfg` is pasted, or when your rcon client
+makes multi-argument `prof_*` commands awkward.
+
+Each `prof_*` alias is a thin wrapper: stash args in `_prof_cli_*` cvars, then
+call `fn_*_entry`. You can do that manually:
+
+```text
+set _prof_cli_guid 602380633711624767525303
+set _prof_cli_nickname slot0test
+sp_sc_func_exec fn_admin_add_entry
+```
+
+Same as `prof_admin_add`. See `profiles_aliases.cfg` for the `_prof_cli_*` cvars
+each entry function expects (`fn_apply_entry`, `fn_admin_del_entry`, etc.).
