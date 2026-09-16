@@ -9,17 +9,16 @@ Optional **systemd** units in `systemd/` wrap the two Python services.
 
 ### Checklist
 
-`systemd/install.sh` only helps with **step 4** (and only the host-side Python
+`systemd/install.sh` only helps with **step 3** (and only the host-side Python
 services — not the game server itself). Everything else is manual.
 
 | # | What | `install.sh` | Notes |
 |---|------|--------------|--------|
 | 1 | Deploy `profiles.func`, `ext_trigger.func` | — | `sofplus/addons/` (names not starting with `-`) |
 | 2 | `user-<PORT>` path for export-fire | — | Symlink **only if** the game uses `User/` — see below |
-| 3 | `mkdir -p …/sofplus/data/profiles` | — | Registry dir for `registry.cfg` |
-| 4 | Python services + `RCON_PASSWORD` | **partial** | Install units, set env (incl. rcon — must match server), `systemctl enable --now` |
-| 5 | `sofplus-cvars.cfg` | — | Set `_sp_sv_limit_userinfo_change` to `1` — see below |
-| 6 | Debug-Stress-Testing | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
+| 3 | Python services + `RCON_PASSWORD` | **partial** | Install units, set env (incl. rcon — must match server), `systemctl enable --now` |
+| 4 | `sofplus-cvars.cfg` | — | Set `_sp_sv_limit_userinfo_change` to `1` — see below |
+| 5 | Debug-Stress-Testing | — | `prof_admin_add`, connect, `prof_apply`, `prof_enforce` |
 
 **Persists on disk:** `profiles.func`, `registry.cfg`, `sofplus-cvars.cfg`, addon files.
 
@@ -277,7 +276,8 @@ Without two variables we would lose the guid the moment userinfo collapsed.
 ## State
 
 **Registry** (`profiles/registry.cfg`): `~reg_<guid>` → nickname,
-`~guid_by_<nickname_clean>` → guid.
+`~guid_by_<nickname_clean>` → guid. Created on first `prof_admin_add` / save
+(`sp_sc_cvar_save` creates the directory if missing).
 
 **Per-slot:** `_prof_remembered_guid_`, `_prof_guid_`, `_prof_team_`,
 `_prof_nickname_`, `_prof_is_registered_` (cleared on disconnect / map change).
@@ -292,7 +292,7 @@ Without two variables we would lose the guid the moment userinfo collapsed.
 ## `userinfo_rcon.py`
 
 Watches export-fire `userinfo` events → `rcon dumpuser <slot>` →
-`snapshot_<slot>.cfg`. `RCON_PASSWORD` and paths: **Setup step 4**. Other env:
+`snapshot_<slot>.cfg`. `RCON_PASSWORD` and paths: **Setup step 3**. Other env:
 `EXPORT_FIRE_HOST`/`PORT`, `RCON_HOST`/`PORT`, `VERBOSE`.
 
 ## Rcon testing
