@@ -120,6 +120,50 @@ reload is covered by the two lines here.
 
 If `pending` and no `snapshot_*.cfg`, check export-fire, userinfo-rcon, and `RCON_PASSWORD`.
 
+## Commands
+
+Run in server console or rcon. Commands marked *paste* need `profiles_aliases.cfg`
+run once after each server restart; others load from `profiles.func` on boot.
+
+| Command | Args | What it does |
+|---------|------|--------------|
+| `prof_admin_add` *paste* | `<guid> <nickname>` | Register; auto-saves |
+| `prof_admin_del` *paste* | `<guid> <nickname>` | Remove by guid **or** nickname (other `""`) |
+| `prof_apply` *paste* | `<slot> <guid>` | Push registered guid to slot |
+| `prof_enforce` | — | Health-check every connected player — see below |
+| `prof_get_slot_by_id` / `by_nick` *paste* | guid / nickname | → `_prof_found_slot` |
+| `prof_admin_save` / `load` | — | Save/load `registry.cfg` |
+
+### `prof_enforce` — check all players and fix lost guids
+
+Walks every **connected, non-spectator** slot. For each one it reads the latest
+`snapshot_<slot>.cfg` (from `dumpuser`) and compares `team_red_blue` to the admin
+registry.
+
+**Per-slot line** (one of):
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| `ok` | Roster player's guid is present in `team_red_blue` | None — identity looks correct |
+| `guest` | Not on the roster (no guid, or guid unknown to admin) | None |
+| `wrong` | Roster player, but userinfo collapsed to bare `0`/`1` (team menu, swap, etc.) | **Fix:** stufftext `remembered_guid + team_bit` back onto the client |
+| `pending` | No snapshot file yet | Requests a new snapshot (needs export-fire + userinfo_rcon) |
+
+**Summary line** at the end, e.g.:
+
+```text
+enforce: 2 ok, 1 wrong, 1 pushed, 0 manual, 0 guests, 0 pending
+```
+
+- `pushed` — `wrong` slots that were stufftext-fixed
+- `manual` — fix was printed but not sent (`_prof_use_stufftext 0`)
+- `guests` / `pending` — counts from the table above
+
+**When to run it:** after `prof_apply`, after a `swap` test, when you suspect a
+roster player lost their guid, or any time you want a status report. Automatic
+restore on userinfo change usually handles collapse without this, but `prof_enforce`
+is the manual “scan everyone and repair” command.
+
 ## How it works
 
 ```
@@ -198,50 +242,6 @@ Without two variables we would lose the guid the moment userinfo collapsed.
 **Flow:** `prof_admin_add` → `prof_apply` → userinfo change → dumpuser snapshot → lookup
 `~reg_<guid>` → bind or re-push `_prof_remembered_guid_` on collapse. Mint:
 `python3 userinfo_rcon.py --mint`.
-
-## Commands
-
-Run in server console or rcon. Commands marked *paste* need `profiles_aliases.cfg`
-run once after each server restart; others load from `profiles.func` on boot.
-
-| Command | Args | What it does |
-|---------|------|--------------|
-| `prof_admin_add` *paste* | `<guid> <nickname>` | Register; auto-saves |
-| `prof_admin_del` *paste* | `<guid> <nickname>` | Remove by guid **or** nickname (other `""`) |
-| `prof_apply` *paste* | `<slot> <guid>` | Push registered guid to slot |
-| `prof_enforce` | — | Health-check every connected player — see below |
-| `prof_get_slot_by_id` / `by_nick` *paste* | guid / nickname | → `_prof_found_slot` |
-| `prof_admin_save` / `load` | — | Save/load `registry.cfg` |
-
-### `prof_enforce` — check all players and fix lost guids
-
-Walks every **connected, non-spectator** slot. For each one it reads the latest
-`snapshot_<slot>.cfg` (from `dumpuser`) and compares `team_red_blue` to the admin
-registry.
-
-**Per-slot line** (one of):
-
-| Status | Meaning | Action |
-|--------|---------|--------|
-| `ok` | Roster player's guid is present in `team_red_blue` | None — identity looks correct |
-| `guest` | Not on the roster (no guid, or guid unknown to admin) | None |
-| `wrong` | Roster player, but userinfo collapsed to bare `0`/`1` (team menu, swap, etc.) | **Fix:** stufftext `remembered_guid + team_bit` back onto the client |
-| `pending` | No snapshot file yet | Requests a new snapshot (needs export-fire + userinfo_rcon) |
-
-**Summary line** at the end, e.g.:
-
-```text
-enforce: 2 ok, 1 wrong, 1 pushed, 0 manual, 0 guests, 0 pending
-```
-
-- `pushed` — `wrong` slots that were stufftext-fixed
-- `manual` — fix was printed but not sent (`_prof_use_stufftext 0`)
-- `guests` / `pending` — counts from the table above
-
-**When to run it:** after `prof_apply`, after a `swap` test, when you suspect a
-roster player lost their guid, or any time you want a status report. Automatic
-restore on userinfo change usually handles collapse without this, but `prof_enforce`
-is the manual “scan everyone and repair” command.
 
 ## State
 
