@@ -258,11 +258,6 @@ is the manual “scan everyone and repair” command.
 | `team_red_blue` (dumpuser snapshot) | Yes | Audit, registry |
 | `_sp_sv_info_client_team` | No | Team bit when re-pushing remembered guid |
 
-## Migration
-
-Legacy `_prof_reg_*`, `_prof_nick_*`, `~nick_*`, `~id_by_label_*` → `~reg_*` /
-`~guid_by_*` on load. Re-`prof_apply` after shortening 62-digit guids.
-
 ## `userinfo_rcon.py`
 
 Watches export-fire `userinfo` events → `rcon dumpuser <slot>` →

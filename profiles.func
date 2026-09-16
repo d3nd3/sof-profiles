@@ -14,7 +14,7 @@
 // metadata for humans and prof_get_slot_by_nick (registry index only).
 //
 // Registry (profiles/registry.cfg) — persisted via ~ locals + sp_sc_cvar_save
-// (same pattern as ~user_* in spf_sv_rcon), not _prof_reg_* globals:
+// (same pattern as ~user_* in spf_sv_rcon):
 //   ~reg_<guid>              = nickname (required on add; 24- or 62-digit guid)
 //   ~guid_by_<nickname_clean> = guid digits (nickname_clean = prof_nickname_clean(nickname))
 // Mint: python3 userinfo_rcon.py --mint
@@ -360,86 +360,12 @@ function fn_admin_save()
   sp_sc_cvar_save profiles/registry.cfg ~reg_* ~guid_by_*
 }
 
-function fn_registry_migrate()
-{
-  set ~dirty 0
-  sp_sc_cvar_find ~found _prof_reg_*
-  sp_sc_flow_if number cvar ~found_0 > val 0
-  {
-    set ~i 1
-    sp_sc_flow_while number cvar ~i <= val #~found_0
-    {
-      sp_sc_cvar_copy ~name ~found_$~i
-      sp_sc_cvar_substr ~id ~name 10 9999
-      sp_sc_cvar_copy ~val #~name
-      sp_sc_cvar_sset ~h ~reg_ #~id
-      set #~h #~val
-      set #~name ""
-      set ~dirty 1
-      add ~i 1
-    }
-  }
-  sp_sc_cvar_find ~found _prof_nick_*
-  sp_sc_flow_if number cvar ~found_0 > val 0
-  {
-    set ~i 1
-    sp_sc_flow_while number cvar ~i <= val #~found_0
-    {
-      sp_sc_cvar_copy ~name ~found_$~i
-      sp_sc_cvar_substr ~nickname_clean ~name 11 9999
-      sp_sc_cvar_copy ~val #~name
-      sp_sc_cvar_sset ~h ~guid_by_ #~nickname_clean
-      set #~h #~val
-      set #~name ""
-      set ~dirty 1
-      add ~i 1
-    }
-  }
-  sp_sc_cvar_find ~found ~nick_*
-  sp_sc_flow_if number cvar ~found_0 > val 0
-  {
-    set ~i 1
-    sp_sc_flow_while number cvar ~i <= val #~found_0
-    {
-      sp_sc_cvar_copy ~name ~found_$~i
-      sp_sc_cvar_substr ~nickname_clean ~name 6 9999
-      sp_sc_cvar_copy ~val #~name
-      sp_sc_cvar_sset ~h ~guid_by_ #~nickname_clean
-      set #~h #~val
-      set #~name ""
-      set ~dirty 1
-      add ~i 1
-    }
-  }
-  sp_sc_cvar_find ~found ~id_by_label_*
-  sp_sc_flow_if number cvar ~found_0 > val 0
-  {
-    set ~i 1
-    sp_sc_flow_while number cvar ~i <= val #~found_0
-    {
-      sp_sc_cvar_copy ~name ~found_$~i
-      sp_sc_cvar_substr ~nickname_clean ~name 13 9999
-      sp_sc_cvar_copy ~val #~name
-      sp_sc_cvar_sset ~h ~guid_by_ #~nickname_clean
-      set #~h #~val
-      set #~name ""
-      set ~dirty 1
-      add ~i 1
-    }
-  }
-  sp_sc_flow_if text val #~dirty == val 1
-  {
-    sp_sc_func_exec fn_admin_save
-  }
-}
-
 function fn_admin_load()
 {
   sp_sc_file_find ~f sofplus/data/profiles/registry.cfg filesystem file
   sp_sc_flow_if number cvar ~f_0 == val 1
   {
     sp_sc_exec_file sofplus/data/profiles/registry.cfg
-    sp_sc_func_exec fn_registry_migrate
   }
 }
 
