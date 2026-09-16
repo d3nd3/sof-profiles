@@ -2,85 +2,6 @@
 
 Admin-assigned player GUID for SoF1, carried in `team_red_blue`.
 
-## How it works
-
-```
-Admin registry (disk)                         Per-slot runtime (memory)
-~reg_<guid> → nickname                        _prof_remembered_guid_<slot>  anchor (survives collapse)
-~guid_by_<nickname_clean> → guid               _prof_guid_<slot>             last good snapshot
-                                              _prof_nickname_<slot>         registry nickname
-                                              _prof_is_registered_<slot>    1 = roster player on this slot
-        │                                              │
-        └──────────── fn_reg_lookup ─────────────────┘
-
-team_red_blue = <guid digits><0|1>   — or bare 0/1 after team menu / swap
-```
-
-### Snapshots
-
-A **snapshot** is `userinfo_rcon.py` running `rcon dumpuser <slot>` on the game
-server, parsing the userinfo block, and writing
-`sofplus/data/userinfo/snapshot_<slot>.cfg`. The server then execs that file
-(`fn_userinfo_read`) after a short timer (see `_prof_userinfo_delay` below).
-
-**Snapshot is requested when:**
-
-| Trigger | Why |
-|---------|-----|
-| Player connects | `fn_client_begin` |
-| `team_red_blue` changes | `_sp_sv_on_client_userinfo_change` → `fn_userinfo_changed` |
-| `prof_register <slot>` | Manual refresh |
-| `prof_apply` / `prof_enforce` | No snapshot yet, or retry after miss |
-
-On userinfo change, `fn_try_restore_live` may re-push the remembered guid
-**immediately** (no snapshot). The snapshot still runs for audit/bind and to
-update `_prof_guid_<slot>` from dumpuser.
-
-### `_prof_userinfo_delay` (default 200ms)
-
-Used only in `fn_request_snapshot`: after `ext_trigger` fires, the server waits
-this long before `fn_userinfo_read` execs `snapshot_<slot>.cfg`. That gap lets
-`userinfo_rcon.py` finish `rcon dumpuser` and write the file — the game cannot
-read a snapshot that does not exist yet.
-
-If the file is still missing, `fn_userinfo_read` retries up to
-`_prof_userinfo_tries` times (default 3) with the same delay. Lower the delay
-for faster feedback; raise it only if you see frequent `pending` audits on a
-slow host. Set `0` if you know snapshots are always ready instantly.
-
-### Why `_prof_guid_<slot>` and `_prof_remembered_guid_<slot>`?
-
-Both hold guid **digits only** (no team bit). They split **what userinfo says now**
-from **who this slot is for the whole connection**:
-
-| Cvar | Updated when | Purpose |
-|------|----------------|---------|
-| `_prof_guid_<slot>` | After each snapshot whose dumpuser `team_red_blue` parses as guid+bit | Mirror of last good dumpuser read |
-| `_prof_remembered_guid_<slot>` | Once, on first valid guid (then kept until disconnect) | Anchor used to rebuild `team_red_blue` after collapse |
-
-**Normal play** — client sends `6023806337116247675253030` (guid + blue). Both
-cvars hold `602380633711624767525303`.
-
-**After team menu / swap** — engine collapses userinfo to bare `0` or `1`. Snapshot
-is no longer parseable as a guid (`_prof_guid_valid = 0`); `_prof_guid_<slot>` is
-cleared or stale. `_prof_remembered_guid_<slot>` still holds
-`602380633711624767525303`, so `fn_try_restore_live` / `fn_maybe_fixup` can
-stufftext `remembered_guid + current_team_bit` back.
-
-Without two variables we would lose the guid the moment userinfo collapsed.
-
-| Term | Meaning |
-|------|---------|
-| `guid` | 24-digit id in `team_red_blue` (bearer token) |
-| `nickname` | Your label for that player in the registry |
-| `nickname_clean` | `nickname` sanitised to `a-z0-9` (reverse lookup key) |
-| **Roster player** | Someone you added with `prof_admin_add` — the server knows their guid and admin nickname. Anyone else connected is a **guest**. |
-| `_prof_is_registered_<slot>` | `1` when this **slot** is currently a roster player (guid applied or confirmed via snapshot). Cleared on disconnect. |
-
-**Flow:** `prof_admin_add` → `prof_apply` → userinfo change → dumpuser snapshot → lookup
-`~reg_<guid>` → bind or re-push `_prof_remembered_guid_` on collapse. Mint:
-`python3 userinfo_rcon.py --mint`.
-
 ## Setup
 
 Three pieces: game server (`.func` addons), **export-fire**, **userinfo_rcon.py**.
@@ -198,6 +119,85 @@ reload is covered by the two lines here.
 5. `swap 0` — auto-restore or run `prof_enforce` again; snapshot should show full guid+team
 
 If `pending` and no `snapshot_*.cfg`, check export-fire, userinfo-rcon, and `RCON_PASSWORD`.
+
+## How it works
+
+```
+Admin registry (disk)                         Per-slot runtime (memory)
+~reg_<guid> → nickname                        _prof_remembered_guid_<slot>  anchor (survives collapse)
+~guid_by_<nickname_clean> → guid               _prof_guid_<slot>             last good snapshot
+                                              _prof_nickname_<slot>         registry nickname
+                                              _prof_is_registered_<slot>    1 = roster player on this slot
+        │                                              │
+        └──────────── fn_reg_lookup ─────────────────┘
+
+team_red_blue = <guid digits><0|1>   — or bare 0/1 after team menu / swap
+```
+
+### Snapshots
+
+A **snapshot** is `userinfo_rcon.py` running `rcon dumpuser <slot>` on the game
+server, parsing the userinfo block, and writing
+`sofplus/data/userinfo/snapshot_<slot>.cfg`. The server then execs that file
+(`fn_userinfo_read`) after a short timer (see `_prof_userinfo_delay` below).
+
+**Snapshot is requested when:**
+
+| Trigger | Why |
+|---------|-----|
+| Player connects | `fn_client_begin` |
+| `team_red_blue` changes | `_sp_sv_on_client_userinfo_change` → `fn_userinfo_changed` |
+| `prof_register <slot>` | Manual refresh |
+| `prof_apply` / `prof_enforce` | No snapshot yet, or retry after miss |
+
+On userinfo change, `fn_try_restore_live` may re-push the remembered guid
+**immediately** (no snapshot). The snapshot still runs for audit/bind and to
+update `_prof_guid_<slot>` from dumpuser.
+
+### `_prof_userinfo_delay` (default 200ms)
+
+Used only in `fn_request_snapshot`: after `ext_trigger` fires, the server waits
+this long before `fn_userinfo_read` execs `snapshot_<slot>.cfg`. That gap lets
+`userinfo_rcon.py` finish `rcon dumpuser` and write the file — the game cannot
+read a snapshot that does not exist yet.
+
+If the file is still missing, `fn_userinfo_read` retries up to
+`_prof_userinfo_tries` times (default 3) with the same delay. Lower the delay
+for faster feedback; raise it only if you see frequent `pending` audits on a
+slow host. Set `0` if you know snapshots are always ready instantly.
+
+### Why `_prof_guid_<slot>` and `_prof_remembered_guid_<slot>`?
+
+Both hold guid **digits only** (no team bit). They split **what userinfo says now**
+from **who this slot is for the whole connection**:
+
+| Cvar | Updated when | Purpose |
+|------|----------------|---------|
+| `_prof_guid_<slot>` | After each snapshot whose dumpuser `team_red_blue` parses as guid+bit | Mirror of last good dumpuser read |
+| `_prof_remembered_guid_<slot>` | Once, on first valid guid (then kept until disconnect) | Anchor used to rebuild `team_red_blue` after collapse |
+
+**Normal play** — client sends `6023806337116247675253030` (guid + blue). Both
+cvars hold `602380633711624767525303`.
+
+**After team menu / swap** — engine collapses userinfo to bare `0` or `1`. Snapshot
+is no longer parseable as a guid (`_prof_guid_valid = 0`); `_prof_guid_<slot>` is
+cleared or stale. `_prof_remembered_guid_<slot>` still holds
+`602380633711624767525303`, so `fn_try_restore_live` / `fn_maybe_fixup` can
+stufftext `remembered_guid + current_team_bit` back.
+
+Without two variables we would lose the guid the moment userinfo collapsed.
+
+| Term | Meaning |
+|------|---------|
+| `guid` | 24-digit id in `team_red_blue` (bearer token) |
+| `nickname` | Your label for that player in the registry |
+| `nickname_clean` | `nickname` sanitised to `a-z0-9` (reverse lookup key) |
+| **Roster player** | Someone you added with `prof_admin_add` — the server knows their guid and admin nickname. Anyone else connected is a **guest**. |
+| `_prof_is_registered_<slot>` | `1` when this **slot** is currently a roster player (guid applied or confirmed via snapshot). Cleared on disconnect. |
+
+**Flow:** `prof_admin_add` → `prof_apply` → userinfo change → dumpuser snapshot → lookup
+`~reg_<guid>` → bind or re-push `_prof_remembered_guid_` on collapse. Mint:
+`python3 userinfo_rcon.py --mint`.
 
 ## Commands
 
