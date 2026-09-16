@@ -1,53 +1,63 @@
 // ---------------------------------------------------------------------------
 // profiles.func - admin-assigned player identity via team_red_blue.
 //
-// Identity design: team_red_blue carries <62 random digits><team 0/1>.
+// Identity design: team_red_blue carries <24 random digits><team 0/1>
+// (25 chars total; ~80 bits). Legacy 62-digit registry keys still work.
 // The game reads it with atoi and uses the smallest bit (0 = blue,
 // 1 = red); parity survives atoi overflow, so the last char stays the
-// team bit and the leading digits are the player identity (~206 bits,
-// infeasible to brute force). Budget (worst case): values cap at 63
-// usable chars; a 63-char team_red_blue costs 78 of the 512 info-string
-// bytes, leaving a guaranteed 434 for the rest (the engine rejects
-// over-budget sets, it never truncates).
+// team bit and the leading digits are the player identity. Engine cap:
+// 63 usable chars per userinfo value (512-byte info-string budget).
 //
-// Authority model: the ADMIN registers identities and optional labels.
+// Authority model: the ADMIN registers identities with a required label.
 // Client userinfo "name" is never read for matching. Recognition is
 // purely by the identity digits in team_red_blue. Admin labels are
 // metadata for humans and prof_find_by_name (registry index only).
 //
-// Registry (profiles/registry.cfg):
-//   _prof_reg_<62digit_id>  = admin label (may be empty)
-//   _prof_nick_<skey>       = id digits (label index; skey = prof_sanitize(label))
+// Registry (profiles/registry.cfg) — persisted via ~ locals + sp_sc_cvar_save
+// (same pattern as ~user_* in spf_sv_rcon), not _prof_reg_* globals:
+//   ~reg_<guid>              = nickname (required on add; 24- or 62-digit guid)
+//   ~guid_by_<nickname_clean> = guid digits (nickname_clean = prof_nickname_clean(nickname))
 // Mint: python3 userinfo_rcon.py --mint
 //
-// Slot-lifetime stash: first valid identity a slot presents -> _prof_stash_<slot>.
-// Bare 0/1 collapse: prof_maybe_fixup stufftexts stash+team when live userinfo
+// Two team sources (do not confuse):
+//   team_red_blue  — userinfo / snapshot / dumpuser; carries identity GUID + bit.
+//   _sp_sv_info_client_team — sp_sv_info_client; in-memory server team only
+//     (1=blue, 2=red). No identity. Used to pick the team bit when re-pushing
+//     stash after collapse; audit/identity always use team_red_blue snapshots.
+//
+// Two per-slot guid cvars (digits only, no team bit):
+//   _prof_guid_<slot>            — last good snapshot (cleared/stale on 0/1 collapse)
+//   _prof_remembered_guid_<slot> — connection anchor; set once, used to re-push after collapse
+// Bare 0/1 collapse: prof_maybe_fixup stufftexts remembered_guid+team when live userinfo
 // differs (dedup on _prof_userinfo_team_red_blue, not last push). prof_enforce
 // for manual sweep. _prof_snap_busy_<slot> + _prof_snap_pending_<slot> coalesce
-// snapshot round-trips.
+// snapshot round-trips. prof_map_begin clears slot state on map change.
 //
-// Flow: ext_trigger -> userinfo_rcon -> snapshot_<slot>.cfg -> prof_userinfo_read.
+// Flow: ext_trigger -> userinfo_rcon -> snapshot_<slot>.cfg -> fn_userinfo_read.
 // Consumer hook: set _prof_userinfo_hook myfunc
-// Per-slot: _prof_id_<slot>, _prof_team_<slot>, _prof_label_<slot>, _prof_member_<slot>
+// Per-slot: _prof_guid_<slot>, _prof_team_<slot>, _prof_nickname_<slot>, _prof_is_registered_<slot>
 // Recommended: set _sp_sv_limit_userinfo_change 1 (see README).
 // ---------------------------------------------------------------------------
 
+// sofplus addon loader calls profiles_init (basename_init); delegate to fn_*.
 function profiles_init()
 {
-  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_begin "prof_client_begin"
-  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_userinfo_change "prof_userinfo_changed"
-  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_disconnect "prof_client_disconnect"
+  sp_sc_func_exec fn_profiles_init
+}
 
-  sp_sc_func_alias prof_register prof_register
-  sp_sc_func_alias prof_find_by_id prof_find_by_id
-  sp_sc_func_alias prof_find_by_name prof_find_by_name
-  sp_sc_func_alias prof_admin_add prof_admin_add
-  sp_sc_func_alias prof_admin_del prof_admin_del
-  sp_sc_func_alias prof_admin_save prof_admin_save
-  sp_sc_func_alias prof_admin_load prof_admin_load
-  sp_sc_func_alias prof_audit prof_audit
-  sp_sc_func_alias prof_apply prof_apply
-  sp_sc_func_alias prof_enforce prof_enforce
+function fn_profiles_init()
+{
+  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_begin "fn_client_begin"
+  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_userinfo_change "fn_userinfo_changed"
+  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_client_disconnect "fn_client_disconnect"
+  sp_sc_func_exec spf_sc_list_add_func _sp_sv_on_map_begin "fn_map_begin"
+
+  // sp_sc_func_exec from rcon/console does not forward ~args; profiles_aliases.cfg
+  // latches into _prof_cli_* then calls fn_*_entry (see README).
+  sp_sc_func_alias prof_admin_save fn_admin_save
+  sp_sc_func_alias prof_admin_load fn_admin_load
+  sp_sc_func_alias prof_audit fn_audit
+  sp_sc_func_alias prof_enforce fn_enforce
 
   sp_sc_flow_if text val #_prof_userinfo_delay == val ""
   {
@@ -62,31 +72,42 @@ function profiles_init()
     set _prof_use_stufftext 1
   }
 
-  sp_sc_func_exec prof_admin_load
+  sp_sc_func_exec fn_admin_load
 }
 
-function prof_client_begin(~slot)
+function fn_client_begin(~slot)
 {
   set _prof_read_slot #~slot
   set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
-  sp_sc_func_exec prof_request_snapshot #~slot
+  sp_sc_func_exec fn_request_snapshot #~slot
 }
 
-function prof_client_disconnect(~slot, *)
+function fn_map_begin()
 {
-  set _prof_id_$~slot ""
+  set ~i 0
+  sp_sc_flow_while number cvar ~i < cvar maxclients
+  {
+    sp_sc_func_exec fn_client_disconnect #~i
+    add ~i 1
+  }
+}
+
+function fn_client_disconnect(~slot, *)
+{
+  set _prof_guid_$~slot ""
   set _prof_team_$~slot ""
-  set _prof_label_$~slot ""
-  set _prof_member_$~slot ""
-  set _prof_id_offered_$~slot ""
-  set _prof_stash_$~slot ""
+  set _prof_nickname_$~slot ""
+  set _prof_is_registered_$~slot ""
+  set _prof_guid_offered_$~slot ""
+  set _prof_remembered_guid_$~slot ""
   set _prof_restored_$~slot ""
   set _prof_snap_busy_$~slot ""
   set _prof_snap_pending_$~slot ""
 }
 
-function prof_userinfo_changed(~slot)
+function fn_userinfo_changed(~slot)
 {
+  sp_sc_func_exec fn_try_restore_live #~slot
   set _prof_read_slot #~slot
   sp_sc_flow_if text val #_prof_snap_busy_$~slot == val 1
   {
@@ -95,66 +116,76 @@ function prof_userinfo_changed(~slot)
   else
   {
     set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
-    sp_sc_func_exec prof_request_snapshot #~slot
+    sp_sc_func_exec fn_request_snapshot #~slot
   }
 }
 
-function prof_userinfo_read_deferred()
+function fn_userinfo_read_deferred()
 {
   sp_sc_cvar_copy ~slot _prof_read_slot
-  sp_sc_func_exec prof_userinfo_read #~slot
-  sp_sc_func_exec prof_enforce_slot #~slot
+  sp_sc_func_exec fn_userinfo_read #~slot
+  sp_sc_func_exec fn_enforce_slot #~slot
 }
 
-function prof_enforce_slot(~slot)
+function fn_enforce_slot(~slot)
 {
-  sp_sc_func_exec prof_audit_slot #~slot
+  sp_sc_func_exec fn_audit_slot #~slot
   sp_sc_flow_if text val #_prof_audit_rc == val wrong
   {
-    sp_sc_func_exec prof_restore_stash_push #~slot
+    sp_sc_func_exec fn_restore_stash_push #~slot
   }
 }
 
-function prof_request_snapshot(~slot)
+function fn_request_snapshot(~slot)
 {
   set _prof_snap_busy_$~slot 1
   set _prof_read_slot #~slot
   sp_sc_func_exec ext_trigger_fire "userinfo" #~slot "" "" ""
   set _prof_userinfo_tries_$~slot #_prof_userinfo_tries
-  sp_sc_timer #_prof_userinfo_delay "sp_sc_func_exec prof_userinfo_read_deferred"
+  sp_sc_timer #_prof_userinfo_delay "sp_sc_func_exec fn_userinfo_read_deferred"
 }
 
-function prof_snapshot_done(~slot)
+function fn_snapshot_done(~slot)
 {
   set _prof_snap_busy_$~slot 0
   sp_sc_flow_if text val #_prof_snap_pending_$~slot == val 1
   {
     set _prof_snap_pending_$~slot 0
-    sp_sc_func_exec prof_request_snapshot #~slot
+    sp_sc_func_exec fn_request_snapshot #~slot
   }
 }
 
-function prof_register()
+function fn_register_entry()
 {
-  sp_sc_flow_if text val #_prof_admin_slot == val ""
+  sp_sc_func_exec fn_register #_prof_cli_slot
+}
+
+function fn_register(~slot)
+{
+  sp_sc_flow_if text val #~slot == val ""
   {
-    echo "usage: set _prof_admin_slot <slot>, then prof_register"
+    echo "usage: prof_register <slot>"
   }
   else
   {
-    sp_sc_func_exec prof_request_snapshot #_prof_admin_slot
+    sp_sc_func_exec fn_request_snapshot #~slot
   }
 }
 
-function prof_find_by_id()
+function fn_find_by_id_entry()
+{
+  sp_sc_func_exec fn_find_by_id #_prof_cli_guid
+}
+
+function fn_find_by_id(~id)
 {
   set _prof_found_slot -1
-  sp_sc_flow_if text val #_prof_admin_id != val ""
+  sp_sc_flow_if text val #~id != val ""
   {
     set ~i 0
     sp_sc_flow_while number cvar ~i < cvar maxclients
     {
-      sp_sc_flow_if text cvar _prof_id_$~i == val #_prof_admin_id
+      sp_sc_flow_if text cvar _prof_guid_$~i == val #~id
       {
         set _prof_found_slot #~i
       }
@@ -163,162 +194,264 @@ function prof_find_by_id()
   }
 }
 
+function fn_find_by_name_entry()
+{
+  sp_sc_func_exec fn_find_by_name #_prof_cli_nickname
+}
+
 // Find a connected slot by admin registry label (not client userinfo name).
-function prof_find_by_name()
+function fn_find_by_name(~label)
 {
   set _prof_found_slot -1
-  sp_sc_flow_if text val #_prof_admin_nick != val ""
+  sp_sc_flow_if text val #~label != val ""
   {
-    sp_sc_func_exec prof_sanitize #_prof_admin_nick
-    sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
-    sp_sc_flow_if text cvar ~idx != val ""
+    sp_sc_func_exec fn_nickname_clean #~label
+    sp_sc_cvar_copy ~nickname_clean _prof_nickname_clean
+    sp_sc_flow_if text cvar ~guid_by_$~nickname_clean != val ""
     {
-      sp_sc_cvar_copy _prof_admin_id #~idx
-      sp_sc_func_exec prof_find_by_id
+      sp_sc_cvar_copy ~id ~guid_by_$~nickname_clean
+      sp_sc_func_exec fn_find_by_id #~id
     }
   }
 }
 
-// Admin-label index key (colors stripped, 0-9a-z). Result in _prof_skey.
-function prof_sanitize(~text)
+// nickname → nickname_clean (colors stripped, a-z0-9). Result in _prof_nickname_clean.
+function fn_nickname_clean(~text)
 {
   sp_sc_cvar_no_color ~plain ~text
   sp_sc_cvar_replace ~plain ~plain "%00-%2f:" "%3a-%60:" "%7b-%ff:"
-  sp_sc_cvar_sset _prof_skey #~plain
+  sp_sc_cvar_sset _prof_nickname_clean #~plain
 }
 
-// Reads _prof_lookup_id; sets _prof_registered 1/0 and _prof_lookup_label.
-function prof_reg_lookup()
+// Reads _prof_lookup_guid; sets _prof_guid_known 1/0 and _prof_lookup_nickname.
+function fn_reg_lookup()
 {
-  set _prof_registered 0
-  zero _prof_lookup_label
-  sp_sc_flow_if text val #_prof_lookup_id != val ""
+  set _prof_guid_known 0
+  zero _prof_lookup_nickname
+  sp_sc_flow_if text val #_prof_lookup_guid != val ""
   {
-    sp_sc_cvar_sset ~reg _prof_reg_ #_prof_lookup_id
-    sp_sc_flow_if text cvar ~reg != val ""
+    sp_sc_cvar_copy ~rid _prof_lookup_guid
+    sp_sc_flow_if text cvar ~reg_$~rid != val ""
     {
-      set _prof_registered 1
-      sp_sc_cvar_copy _prof_lookup_label #~reg
+      set _prof_guid_known 1
+      sp_sc_cvar_copy _prof_lookup_nickname ~reg_$~rid
     }
   }
 }
 
-function prof_id_valid()
+function fn_guid_digits_only(~id)
 {
-  sp_sc_cvar_len ~len _prof_admin_id
-  sp_sc_flow_if number cvar ~len != val 62
+  set _prof_guid_check 0
+  sp_sc_cvar_copy ~digits ~id
+  sp_sc_cvar_replace ~digits ~digits "%30:" "%31:" "%32:" "%33:" "%34:" "%35:" "%36:" "%37:" "%38:" "%39:"
+  sp_sc_flow_if text cvar ~digits == val ""
   {
-    set _prof_id_check 0
+    set _prof_guid_check 1
+  }
+}
+
+function fn_guid_valid(~id)
+{
+  set _prof_guid_check 0
+  sp_sc_cvar_len ~len ~id
+  sp_sc_flow_if number cvar ~len == val 24
+  {
+    sp_sc_func_exec fn_guid_digits_only #~id
   }
   else
   {
-    sp_sc_cvar_copy ~digits _prof_admin_id
-    sp_sc_cvar_replace ~digits ~digits "%30:" "%31:" "%32:" "%33:" "%34:" "%35:" "%36:" "%37:" "%38:" "%39:"
-    sp_sc_flow_if text cvar ~digits != val ""
+    sp_sc_flow_if number cvar ~len == val 62
     {
-      set _prof_id_check 0
-    }
-    else
-    {
-      set _prof_id_check 1
+      sp_sc_func_exec fn_guid_digits_only #~id
     }
   }
 }
 
-function prof_admin_add()
+function fn_admin_add_entry()
 {
-  sp_sc_flow_if text val #_prof_admin_id == val ""
+  sp_sc_func_exec fn_admin_add_latched
+}
+
+function fn_admin_add_latched()
+{
+  sp_sc_flow_if text val #_prof_cli_guid == val ""
   {
-    echo "usage: set _prof_admin_id <identity62>, set _prof_admin_nick <label>, prof_admin_add"
+    echo "usage: prof_admin_add <guid24> <nickname>"
   }
   else
   {
-    sp_sc_func_exec prof_id_valid
-    sp_sc_flow_if text val #_prof_id_check != val 1
+    sp_sc_func_exec fn_guid_valid #_prof_cli_guid
+    sp_sc_flow_if text val #_prof_guid_check != val 1
     {
-      echo "prof_admin_add: identity must be 62 digits"
+      echo "prof_admin_add: guid must be 24 digits (legacy 62 ok)"
     }
     else
     {
-      sp_sc_cvar_sset ~reg _prof_reg_ #_prof_admin_id
-      set #~reg #_prof_admin_nick
-      sp_sc_flow_if text val #_prof_admin_nick != val ""
+      sp_sc_flow_if text val #_prof_cli_nickname == val ""
       {
-        sp_sc_func_exec prof_sanitize #_prof_admin_nick
-        sp_sc_flow_if text val #_prof_skey != val ""
+        echo "prof_admin_add: nickname is required"
+      }
+      else
+      {
+        sp_sc_func_exec fn_nickname_clean #_prof_cli_nickname
+        sp_sc_flow_if text val #_prof_nickname_clean == val ""
         {
-          sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
-          set #~idx #_prof_admin_id
+          echo "prof_admin_add: nickname must contain letters or digits"
+        }
+        else
+        {
+          sp_sc_cvar_copy ~id _prof_cli_guid
+          sp_sc_cvar_sset ~reg_$~id #_prof_cli_nickname
+          sp_sc_cvar_copy ~nickname_clean _prof_nickname_clean
+          sp_sc_cvar_sset ~guid_by_$~nickname_clean #_prof_cli_guid
+          sp_sc_func_exec fn_admin_save
+          sset ~msg registry guid #_prof_cli_guid nickname #_prof_cli_nickname
+          echo $~msg
         }
       }
-      sp_sc_func_exec prof_admin_save
-      sset ~msg registry id #_prof_admin_id label #_prof_admin_nick
-      echo $~msg
-      zero _prof_admin_nick
-      zero _prof_admin_id
     }
   }
 }
 
-function prof_admin_del()
+function fn_admin_add(~id, ~label)
 {
-  sp_sc_flow_if text val #_prof_admin_id == val ""
+  sp_sc_func_exec fn_admin_add_latched
+}
+
+function fn_admin_del_entry()
+{
+  sp_sc_func_exec fn_admin_del #_prof_cli_guid #_prof_cli_nickname
+}
+
+function fn_admin_del(~id, ~label)
+{
+  sp_sc_flow_if text val #~id == val ""
   {
-    sp_sc_flow_if text val #_prof_admin_nick == val ""
+    sp_sc_flow_if text val #~label == val ""
     {
-      echo "usage: set _prof_admin_id <identity62> or _prof_admin_nick <label>, prof_admin_del"
+      echo "usage: prof_admin_del <guid24> <nickname>"
+      echo "       pass guid or nickname (other arg empty)"
     }
     else
     {
-      sp_sc_func_exec prof_sanitize #_prof_admin_nick
-      sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
-      sp_sc_cvar_copy ~id #~idx
-      sp_sc_flow_if text val #~id == val ""
+      sp_sc_func_exec fn_nickname_clean #~label
+      sp_sc_cvar_copy ~nickname_clean _prof_nickname_clean
+      sp_sc_cvar_copy ~rid ~guid_by_$~nickname_clean
+      sp_sc_flow_if text val #~rid == val ""
       {
         echo "prof_admin_del: label not in registry"
       }
       else
       {
-        set _prof_admin_id #~id
-        zero _prof_admin_nick
-        sp_sc_func_exec prof_admin_del
+        sp_sc_func_exec fn_admin_del #~rid ""
       }
     }
   }
   else
   {
-    sp_sc_cvar_sset ~reg _prof_reg_ #_prof_admin_id
-    sp_sc_cvar_copy ~lbl #~reg
-    set #~reg ""
+    sp_sc_cvar_copy ~lbl ~reg_$~id
+    sp_sc_cvar_sset ~reg_$~id ""
     sp_sc_flow_if text val #~lbl != val ""
     {
-      sp_sc_func_exec prof_sanitize #~lbl
-      sp_sc_cvar_sset ~idx _prof_nick_ #_prof_skey
-      set #~idx ""
+      sp_sc_func_exec fn_nickname_clean #~lbl
+      sp_sc_cvar_copy ~nickname_clean _prof_nickname_clean
+      sp_sc_cvar_sset ~guid_by_$~nickname_clean ""
     }
-    sp_sc_func_exec prof_admin_save
-    sset ~msg registry removed id #_prof_admin_id
+    sp_sc_func_exec fn_admin_save
+    sset ~msg registry removed id #~id
     echo $~msg
-    zero _prof_admin_nick
-    zero _prof_admin_id
   }
 }
 
-function prof_admin_save()
+function fn_admin_save()
 {
-  sp_sc_cvar_save profiles/registry.cfg _prof_reg_* _prof_nick_*
+  sp_sc_cvar_save profiles/registry.cfg ~reg_* ~guid_by_*
 }
 
-function prof_admin_load()
+function fn_registry_migrate()
+{
+  set ~dirty 0
+  sp_sc_cvar_find ~found _prof_reg_*
+  sp_sc_flow_if number cvar ~found_0 > val 0
+  {
+    set ~i 1
+    sp_sc_flow_while number cvar ~i <= val #~found_0
+    {
+      sp_sc_cvar_copy ~name ~found_$~i
+      sp_sc_cvar_substr ~id ~name 10 9999
+      sp_sc_cvar_copy ~val #~name
+      sp_sc_cvar_sset ~h ~reg_ #~id
+      set #~h #~val
+      set #~name ""
+      set ~dirty 1
+      add ~i 1
+    }
+  }
+  sp_sc_cvar_find ~found _prof_nick_*
+  sp_sc_flow_if number cvar ~found_0 > val 0
+  {
+    set ~i 1
+    sp_sc_flow_while number cvar ~i <= val #~found_0
+    {
+      sp_sc_cvar_copy ~name ~found_$~i
+      sp_sc_cvar_substr ~nickname_clean ~name 11 9999
+      sp_sc_cvar_copy ~val #~name
+      sp_sc_cvar_sset ~h ~guid_by_ #~nickname_clean
+      set #~h #~val
+      set #~name ""
+      set ~dirty 1
+      add ~i 1
+    }
+  }
+  sp_sc_cvar_find ~found ~nick_*
+  sp_sc_flow_if number cvar ~found_0 > val 0
+  {
+    set ~i 1
+    sp_sc_flow_while number cvar ~i <= val #~found_0
+    {
+      sp_sc_cvar_copy ~name ~found_$~i
+      sp_sc_cvar_substr ~nickname_clean ~name 6 9999
+      sp_sc_cvar_copy ~val #~name
+      sp_sc_cvar_sset ~h ~guid_by_ #~nickname_clean
+      set #~h #~val
+      set #~name ""
+      set ~dirty 1
+      add ~i 1
+    }
+  }
+  sp_sc_cvar_find ~found ~id_by_label_*
+  sp_sc_flow_if number cvar ~found_0 > val 0
+  {
+    set ~i 1
+    sp_sc_flow_while number cvar ~i <= val #~found_0
+    {
+      sp_sc_cvar_copy ~name ~found_$~i
+      sp_sc_cvar_substr ~nickname_clean ~name 13 9999
+      sp_sc_cvar_copy ~val #~name
+      sp_sc_cvar_sset ~h ~guid_by_ #~nickname_clean
+      set #~h #~val
+      set #~name ""
+      set ~dirty 1
+      add ~i 1
+    }
+  }
+  sp_sc_flow_if text val #~dirty == val 1
+  {
+    sp_sc_func_exec fn_admin_save
+  }
+}
+
+function fn_admin_load()
 {
   sp_sc_file_find ~f sofplus/data/profiles/registry.cfg filesystem file
   sp_sc_flow_if number cvar ~f_0 == val 1
   {
     sp_sc_exec_file sofplus/data/profiles/registry.cfg
+    sp_sc_func_exec fn_registry_migrate
   }
 }
 
-function prof_slot_info(~slot)
+function fn_slot_info(~slot)
 {
   set _prof_ps_present 0
   zero _sp_sv_info_client_ip
@@ -330,18 +463,18 @@ function prof_slot_info(~slot)
   }
 }
 
-function prof_offer_key(~slot, ~full)
+function fn_offer_key(~slot, ~full)
 {
-  sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
+  sp_sc_flow_if text val #_prof_guid_offered_$~slot != val 1
   {
     sset ~msg "%04Profile setup required. Contact an admin."
     sp_sc_cvar_unescape ~msg ~msg
     sp_sv_print_client #~slot #~msg
-    set _prof_id_offered_$~slot 1
+    set _prof_guid_offered_$~slot 1
   }
 }
 
-function prof_offer_id(~slot, ~idpart)
+function fn_offer_id(~slot, ~idpart)
 {
   sp_sc_cvar_copy ~team _prof_team
   sp_sc_flow_if text val #~team == val 0
@@ -358,90 +491,170 @@ function prof_offer_id(~slot, ~idpart)
     }
   }
   sp_sc_cvar_sset ~full #~idpart #~team
-  sp_sc_func_exec prof_offer_key #~slot #~full
+  sp_sc_func_exec fn_offer_key #~slot #~full
 }
 
-function prof_notice_mismatch(~slot)
+function fn_notice_mismatch(~slot)
 {
-  sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
+  sp_sc_flow_if text val #_prof_guid_offered_$~slot != val 1
   {
     sset ~msg "%02Profile verification failed. Contact an admin."
     sp_sc_cvar_unescape ~msg ~msg
     sp_sv_print_client #~slot #~msg
-    set _prof_id_offered_$~slot 1
+    set _prof_guid_offered_$~slot 1
+  }
+}
+
+// In-memory server team only (not team_red_blue / not identity). Result: _prof_live_team 0/1/-1.
+function fn_live_team_bit(~slot)
+{
+  set _prof_live_team -1
+  zero _sp_sv_info_client_ip
+  sp_sv_info_client #~slot
+  sp_sc_flow_if text cvar _sp_sv_info_client_ip != val ""
+  {
+    sp_sc_flow_if text cvar _sp_sv_info_client_team == val 2
+    {
+      set _prof_live_team 1
+    }
+    else
+    {
+      sp_sc_flow_if text cvar _sp_sv_info_client_team == val 1
+      {
+        set _prof_live_team 0
+      }
+    }
+  }
+}
+
+// Immediate restore on userinfo hook using live server team (no snapshot wait).
+function fn_try_restore_live(~slot)
+{
+  sp_sc_cvar_copy _prof_lookup_guid _prof_remembered_guid_$~slot
+  sp_sc_flow_if text val #_prof_lookup_guid != val ""
+  {
+    sp_sc_func_exec fn_reg_lookup
+    sp_sc_flow_if text val #_prof_guid_known == val 1
+    {
+      set _prof_guid_valid 0
+      sp_sc_func_exec fn_restore_stash_push #~slot
+    }
   }
 }
 
 // Push stash+current_team when live userinfo != stash+team (dedup on client value).
-function prof_restore_stash_push(~slot)
+function fn_restore_stash_push(~slot)
 {
-  sp_sc_cvar_copy ~team _prof_team
-  sp_sc_flow_if text val #~team == val 0
+  sp_sc_func_exec fn_live_team_bit #~slot
+  sp_sc_flow_if text val #_prof_live_team == val 0
   {
+    set ~team 0
   }
   else
   {
-    sp_sc_flow_if text val #~team == val 1
+    sp_sc_flow_if text val #_prof_live_team == val 1
     {
+      set ~team 1
     }
     else
     {
-      sp_sc_cvar_copy ~team _prof_team_$~slot
+      sp_sc_cvar_copy ~team _prof_team
+      sp_sc_flow_if text val #~team == val 0
+      {
+      }
+      else
+      {
+        sp_sc_flow_if text val #~team == val 1
+        {
+        }
+        else
+        {
+          sp_sc_cvar_copy ~team _prof_team_$~slot
+        }
+      }
     }
   }
-  sp_sc_cvar_copy ~st _prof_stash_$~slot
+  sp_sc_cvar_copy ~st _prof_remembered_guid_$~slot
   sp_sc_flow_if text val #~st != val ""
   {
     sp_sc_cvar_sset ~full #~st #~team
-    sp_sc_cvar_copy ~cur _prof_userinfo_team_red_blue
-    sp_sc_flow_if text cvar ~cur != val #~full
+    sp_sc_flow_if text val #_prof_guid_valid == val 1
     {
-      sp_sc_cvar_copy _prof_push_id _prof_stash_$~slot
-      sp_sc_func_exec prof_push_checked #~slot #~team
-      sp_sc_flow_if text val #_prof_push_rc == val pushed
+      sp_sc_cvar_copy ~cur _prof_userinfo_team_red_blue
+      sp_sc_flow_if text cvar ~cur != val #~full
       {
-        set _prof_restored_$~slot #~full
-        set _prof_team_$~slot #~team
+        sp_sc_func_exec fn_restore_stash_do #~slot #~team #~full
       }
+    }
+    else
+    {
+      sp_sc_func_exec fn_restore_stash_do #~slot #~team #~full
     }
   }
 }
 
-function prof_maybe_fixup(~slot)
+function fn_restore_stash_do(~slot, ~team, ~full)
 {
-  sp_sc_flow_if text val #_prof_id_valid == val 1
+  sp_sc_cvar_copy _prof_push_guid _prof_remembered_guid_$~slot
+  sp_sc_func_exec fn_push_checked #~slot #~team
+  sp_sc_flow_if text val #_prof_push_rc == val pushed
+  {
+    set _prof_restored_$~slot #~full
+    set _prof_team_$~slot #~team
+  }
+}
+
+function fn_maybe_fixup(~slot)
+{
+  sp_sc_flow_if text val #_prof_guid_valid == val 1
   {
   }
   else
   {
-    sp_sc_cvar_copy _prof_lookup_id _prof_stash_$~slot
-    sp_sc_flow_if text val #_prof_lookup_id != val ""
+    sp_sc_cvar_copy _prof_lookup_guid _prof_remembered_guid_$~slot
+    sp_sc_flow_if text val #_prof_lookup_guid != val ""
     {
-      sp_sc_func_exec prof_reg_lookup
-      sp_sc_flow_if text val #_prof_registered == val 1
+      sp_sc_func_exec fn_reg_lookup
+      sp_sc_flow_if text val #_prof_guid_known == val 1
       {
-        sp_sc_func_exec prof_restore_stash_push #~slot
+        sp_sc_func_exec fn_restore_stash_push #~slot
       }
     }
   }
 }
 
-function prof_bind_slot(~slot)
+function fn_bind_slot(~slot)
 {
-  sp_sc_cvar_copy _prof_lookup_id _prof_id
-  sp_sc_func_exec prof_reg_lookup
-  sp_sc_flow_if text val #_prof_registered == val 1
+  sp_sc_cvar_copy _prof_lookup_guid _prof_guid
+  sp_sc_func_exec fn_reg_lookup
+  sp_sc_flow_if text val #_prof_guid_known == val 1
   {
-    sp_sc_cvar_copy _prof_id_$~slot _prof_id
-    set _prof_team_$~slot #_prof_team
-    sp_sc_cvar_copy _prof_label_$~slot _prof_lookup_label
-    set _prof_member_$~slot 1
-    set _prof_id_offered_$~slot 0
-    sp_sc_cvar_copy _prof_stash_$~slot _prof_id
+    sp_sc_cvar_copy ~st _prof_remembered_guid_$~slot
+    sp_sc_flow_if text val #~st == val ""
+    {
+      sp_sc_func_exec fn_bind_slot_do #~slot
+    }
+    else
+    {
+      sp_sc_flow_if text cvar ~st == val #_prof_guid
+      {
+        sp_sc_func_exec fn_bind_slot_do #~slot
+      }
+    }
   }
 }
 
-function prof_userinfo_read(~slot)
+function fn_bind_slot_do(~slot)
+{
+  sp_sc_cvar_copy _prof_guid_$~slot _prof_guid
+  set _prof_team_$~slot #_prof_team
+  sp_sc_cvar_copy _prof_nickname_$~slot _prof_lookup_nickname
+  set _prof_is_registered_$~slot 1
+  set _prof_guid_offered_$~slot 0
+  sp_sc_cvar_copy _prof_remembered_guid_$~slot _prof_guid
+}
+
+function fn_userinfo_read(~slot)
 {
   sp_sc_cvar_sset ~snap userinfo/snapshot_ $~slot .cfg
   sp_sc_file_find ~f sofplus/data/$~snap filesystem file
@@ -451,52 +664,52 @@ function prof_userinfo_read(~slot)
     sp_sc_exec_file #~exec
     set _prof_userinfo_tries_$~slot 0
 
-    sp_sc_flow_if text val #_prof_id_valid == val 1
+    sp_sc_flow_if text val #_prof_guid_valid == val 1
     {
-      sp_sc_cvar_copy _prof_lookup_id _prof_id
-      sp_sc_func_exec prof_reg_lookup
-      sp_sc_flow_if text val #_prof_registered == val 1
+      sp_sc_cvar_copy _prof_lookup_guid _prof_guid
+      sp_sc_func_exec fn_reg_lookup
+      sp_sc_flow_if text val #_prof_guid_known == val 1
       {
-        sp_sc_func_exec prof_bind_slot #~slot
+        sp_sc_func_exec fn_bind_slot #~slot
       }
       else
       {
-        sp_sc_cvar_copy _prof_id_$~slot _prof_id
+        sp_sc_cvar_copy _prof_guid_$~slot _prof_guid
         set _prof_team_$~slot #_prof_team
-        set _prof_label_$~slot ""
-        set _prof_member_$~slot 0
-        sp_sc_cvar_copy ~st _prof_stash_$~slot
+        set _prof_nickname_$~slot ""
+        set _prof_is_registered_$~slot 0
+        sp_sc_cvar_copy ~st _prof_remembered_guid_$~slot
         sp_sc_flow_if text val #~st == val ""
         {
-          sp_sc_cvar_copy _prof_stash_$~slot _prof_id
+          sp_sc_cvar_copy _prof_remembered_guid_$~slot _prof_guid
         }
       }
     }
     else
     {
-      set _prof_member_$~slot 0
-      set _prof_id_$~slot ""
+      set _prof_is_registered_$~slot 0
+      set _prof_guid_$~slot ""
       set _prof_team_$~slot #_prof_team
-      sp_sc_flow_if text val #_prof_id_offered_$~slot != val 1
+      sp_sc_flow_if text val #_prof_guid_offered_$~slot != val 1
       {
-        sp_sc_cvar_copy ~st _prof_stash_$~slot
+        sp_sc_cvar_copy ~st _prof_remembered_guid_$~slot
         sp_sc_flow_if text val #~st == val ""
         {
-          sp_sc_flow_if text val #_prof_id_new != val ""
+          sp_sc_flow_if text val #_prof_guid_new != val ""
           {
-            sp_sc_func_exec prof_offer_id #~slot #_prof_id_new
+            sp_sc_func_exec fn_offer_id #~slot #_prof_guid_new
           }
         }
       }
     }
 
-    sp_sc_func_exec prof_maybe_fixup #~slot
+    sp_sc_func_exec fn_maybe_fixup #~slot
 
     sp_sc_flow_if text val #_prof_userinfo_hook != val ""
     {
       sp_sc_func_exec #_prof_userinfo_hook #~slot
     }
-    sp_sc_func_exec prof_snapshot_done #~slot
+    sp_sc_func_exec fn_snapshot_done #~slot
   }
   else
   {
@@ -506,17 +719,17 @@ function prof_userinfo_read(~slot)
       add ~tries -1
       set _prof_userinfo_tries_$~slot #~tries
       set _prof_read_slot #~slot
-      sp_sc_timer #_prof_userinfo_delay "sp_sc_func_exec prof_userinfo_read_deferred"
+      sp_sc_timer #_prof_userinfo_delay "sp_sc_func_exec fn_userinfo_read_deferred"
     }
     else
     {
       echo "prof_userinfo_read: no snapshot for slot, giving up"
-      sp_sc_func_exec prof_snapshot_done #~slot
+      sp_sc_func_exec fn_snapshot_done #~slot
     }
   }
 }
 
-function prof_audit_slot(~slot)
+function fn_audit_slot(~slot)
 {
   set _prof_audit_rc guest
   sp_sc_cvar_sset ~snap userinfo/snapshot_ $~slot .cfg
@@ -525,11 +738,11 @@ function prof_audit_slot(~slot)
   {
     sp_sc_cvar_sset ~exec sofplus/data/ #~snap
     sp_sc_exec_file #~exec
-    sp_sc_flow_if text val #_prof_id_valid == val 1
+    sp_sc_flow_if text val #_prof_guid_valid == val 1
     {
-      sp_sc_cvar_copy _prof_lookup_id _prof_id
-      sp_sc_func_exec prof_reg_lookup
-      sp_sc_flow_if text val #_prof_registered == val 1
+      sp_sc_cvar_copy _prof_lookup_guid _prof_guid
+      sp_sc_func_exec fn_reg_lookup
+      sp_sc_flow_if text val #_prof_guid_known == val 1
       {
         set _prof_audit_rc ok
       }
@@ -540,11 +753,11 @@ function prof_audit_slot(~slot)
     }
     else
     {
-      sp_sc_cvar_copy _prof_lookup_id _prof_stash_$~slot
-      sp_sc_flow_if text val #_prof_lookup_id != val ""
+      sp_sc_cvar_copy _prof_lookup_guid _prof_remembered_guid_$~slot
+      sp_sc_flow_if text val #_prof_lookup_guid != val ""
       {
-        sp_sc_func_exec prof_reg_lookup
-        sp_sc_flow_if text val #_prof_registered == val 1
+        sp_sc_func_exec fn_reg_lookup
+        sp_sc_flow_if text val #_prof_guid_known == val 1
         {
           set _prof_audit_rc wrong
         }
@@ -557,7 +770,7 @@ function prof_audit_slot(~slot)
   }
 }
 
-function prof_audit()
+function fn_audit()
 {
   set ~nok 0
   set ~nbad 0
@@ -566,15 +779,15 @@ function prof_audit()
   set ~i 0
   sp_sc_flow_while number cvar ~i < cvar maxclients
   {
-    sp_sc_func_exec prof_slot_info #~i
+    sp_sc_func_exec fn_slot_info #~i
     sp_sc_flow_if number cvar _prof_ps_present == val 1
     {
       sp_sc_flow_if text cvar _prof_ps_spec == val 0
       {
-        sp_sc_func_exec prof_audit_slot #~i
+        sp_sc_func_exec fn_audit_slot #~i
         sp_sc_flow_if text val #_prof_audit_rc == val ok
         {
-          sset ~msg slot #~i ok id #_prof_id label #_prof_lookup_label
+          sset ~msg slot #~i ok guid #_prof_guid nickname #_prof_lookup_nickname
           echo $~msg
           add ~nok 1
         }
@@ -582,7 +795,7 @@ function prof_audit()
         {
           sp_sc_flow_if text val #_prof_audit_rc == val wrong
           {
-            sset ~msg slot #~i wrong: #_prof_userinfo_team_red_blue stash #_prof_stash_$~i
+            sset ~msg slot #~i wrong: #_prof_userinfo_team_red_blue remembered #_prof_remembered_guid_$~i
             echo $~msg
             add ~nbad 1
           }
@@ -598,7 +811,7 @@ function prof_audit()
             {
               sset ~msg slot #~i pending: no snapshot, requesting
               echo $~msg
-              sp_sc_func_exec prof_request_snapshot #~i
+              sp_sc_func_exec fn_request_snapshot #~i
               add ~npending 1
             }
           }
@@ -611,57 +824,75 @@ function prof_audit()
   echo $~msg
 }
 
-function prof_apply()
+function fn_apply_entry()
 {
-  sp_sc_cvar_copy ~slot _prof_admin_slot
-  sp_sc_cvar_copy ~id _prof_admin_id
+  sp_sc_func_exec fn_apply #_prof_cli_slot #_prof_cli_guid
+}
+
+function fn_apply(~slot, ~id)
+{
   sp_sc_flow_if text val #~slot == val ""
   {
-    echo "usage: set _prof_admin_slot <slot>, set _prof_admin_id <identity62>, prof_apply"
+    echo "usage: prof_apply <slot> <guid24>"
   }
   else
   {
     sp_sc_flow_if text val #~id == val ""
     {
-      echo "usage: set _prof_admin_slot <slot>, set _prof_admin_id <identity62>, prof_apply"
+      echo "usage: prof_apply <slot> <guid24>"
     }
     else
     {
-      sp_sc_func_exec prof_slot_info #~slot
+      sp_sc_func_exec fn_slot_info #~slot
       sp_sc_flow_if number cvar _prof_ps_present != val 1
       {
         echo "prof_apply: slot empty"
       }
       else
       {
-        sp_sc_cvar_copy _prof_lookup_id _prof_admin_id
-        sp_sc_func_exec prof_reg_lookup
-        sp_sc_flow_if text val #_prof_registered != val 1
+        sp_sc_cvar_copy _prof_lookup_guid ~id
+        sp_sc_func_exec fn_reg_lookup
+        sp_sc_flow_if text val #_prof_guid_known != val 1
         {
-          echo "prof_apply: identity not registered, use prof_admin_add first"
+          echo "prof_apply: guid not registered, use prof_admin_add first"
         }
         else
         {
-          sp_sc_cvar_copy _prof_push_id _prof_admin_id
-          sp_sc_cvar_copy ~team _prof_team_$~slot
-          sp_sc_flow_if text val #~team == val 0
+          sp_sc_cvar_copy _prof_push_guid ~id
+          sp_sc_func_exec fn_live_team_bit #~slot
+          sp_sc_flow_if text val #_prof_live_team == val 0
           {
+            set ~team 0
           }
           else
           {
-            sp_sc_flow_if text val #~team == val 1
+            sp_sc_flow_if text val #_prof_live_team == val 1
             {
+              set ~team 1
             }
             else
             {
-              sp_sc_cvar_copy ~team _prof_team
+              sp_sc_cvar_copy ~team _prof_team_$~slot
+              sp_sc_flow_if text val #~team == val 0
+              {
+              }
+              else
+              {
+                sp_sc_flow_if text val #~team == val 1
+                {
+                }
+                else
+                {
+                  sp_sc_cvar_copy ~team _prof_team
+                }
+              }
             }
           }
-          sp_sc_func_exec prof_push_checked #~slot #~team
+          sp_sc_func_exec fn_push_checked #~slot #~team
           sp_sc_flow_if text val #_prof_push_rc == val failed
           {
             echo "prof_apply: no team data yet, requesting snapshot"
-            sp_sc_func_exec prof_request_snapshot #~slot
+            sp_sc_func_exec fn_request_snapshot #~slot
           }
         }
       }
@@ -669,11 +900,13 @@ function prof_apply()
   }
 }
 
-function prof_push_slot(~slot)
+function fn_push_slot(~slot)
 {
   sp_sc_cvar_copy ~team _prof_team_$~slot
-  sp_sc_cvar_sset ~full #_prof_push_id #~team
-  sp_sc_cvar_copy _prof_stash_$~slot _prof_push_id
+  sp_sc_cvar_sset ~full #_prof_push_guid #~team
+  sp_sc_cvar_copy _prof_remembered_guid_$~slot _prof_push_guid
+  sp_sc_cvar_copy _prof_guid_$~slot _prof_push_guid
+  set _prof_is_registered_$~slot 1
   sp_sc_flow_if text val #_prof_use_stufftext == val 1
   {
     stufftext #~slot team_red_blue #~full
@@ -688,13 +921,13 @@ function prof_push_slot(~slot)
   }
 }
 
-function prof_push_checked(~slot, ~team)
+function fn_push_checked(~slot, ~team)
 {
   set _prof_push_rc failed
   sp_sc_flow_if text val #~team == val 0
   {
     set _prof_team_$~slot #~team
-    sp_sc_func_exec prof_push_slot #~slot
+    sp_sc_func_exec fn_push_slot #~slot
     sp_sc_flow_if text val #_prof_use_stufftext == val 1
     {
       set _prof_push_rc pushed
@@ -709,7 +942,7 @@ function prof_push_checked(~slot, ~team)
     sp_sc_flow_if text val #~team == val 1
     {
       set _prof_team_$~slot #~team
-      sp_sc_func_exec prof_push_slot #~slot
+      sp_sc_func_exec fn_push_slot #~slot
       sp_sc_flow_if text val #_prof_use_stufftext == val 1
       {
         set _prof_push_rc pushed
@@ -722,7 +955,7 @@ function prof_push_checked(~slot, ~team)
   }
 }
 
-function prof_enforce()
+function fn_enforce()
 {
   set ~nok 0
   set ~nfix 0
@@ -732,22 +965,22 @@ function prof_enforce()
   set ~i 0
   sp_sc_flow_while number cvar ~i < cvar maxclients
   {
-    sp_sc_func_exec prof_slot_info #~i
+    sp_sc_func_exec fn_slot_info #~i
     sp_sc_flow_if number cvar _prof_ps_present == val 1
     {
       sp_sc_flow_if text cvar _prof_ps_spec == val 0
       {
-        sp_sc_func_exec prof_audit_slot #~i
+        sp_sc_func_exec fn_audit_slot #~i
         sp_sc_flow_if text val #_prof_audit_rc == val ok
         {
-          set _prof_member_$~i 1
+          set _prof_is_registered_$~i 1
           add ~nok 1
         }
         else
         {
           sp_sc_flow_if text val #_prof_audit_rc == val wrong
           {
-            sp_sc_func_exec prof_restore_stash_push #~i
+            sp_sc_func_exec fn_restore_stash_push #~i
             sp_sc_flow_if text val #_prof_push_rc == val pushed
             {
               add ~nfix 1
@@ -760,7 +993,7 @@ function prof_enforce()
               }
               else
               {
-                sp_sc_func_exec prof_request_snapshot #~i
+                sp_sc_func_exec fn_request_snapshot #~i
                 add ~npending 1
               }
             }
@@ -773,7 +1006,7 @@ function prof_enforce()
             }
             else
             {
-              sp_sc_func_exec prof_request_snapshot #~i
+              sp_sc_func_exec fn_request_snapshot #~i
               add ~npending 1
             }
           }

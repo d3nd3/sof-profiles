@@ -64,11 +64,10 @@ KNOWN_USERINFO_KEYS = frozenset({
 # guaranteed 434 bytes for the rest -- overflow is impossible because the
 # engine rejects over-budget sets instead of truncating. With the default
 # 14-key block (118 key chars + 28 backslashes = 146 fixed overhead) the
-# other 13 values share 512 - 146 - 63 = 303 bytes (~23 avg); shortening
-# the token would free only ~30 bytes there, so we keep the longest legal
-# 62 identity digits (~206 bits) + team bit.
+# other 13 values share 512 - 146 - 63 = 303 bytes (~23 avg).
 MAX_USERINFO_VALUE = 63
-IDENTITY_DIGITS = MAX_USERINFO_VALUE - 1  # 62
+IDENTITY_DIGITS = 24  # + 1 team bit = 25 chars (~80 bits); max legal is 62+1
+LEGACY_IDENTITY_DIGITS = 62  # pre-shortening registry entries still accepted
 
 
 def parse_dumpuser(text: str, extra_keys=None, on_ambiguous=None) -> Dict[str, str]:
@@ -133,8 +132,8 @@ def split_identity(value: str):
     bit the game reads via atoi). ``team`` mirrors the game (atoi low bit)
     for any all-digit value -- so legacy single-digit "0"/"1" still yield
     their team -- and is -1 otherwise. Trust model: trust-on-first-use;
-    whoever controls the client userinfo owns the binding, and guessing
-    a 62-digit token is infeasible.
+    whoever controls the client userinfo owns the binding. New mints use
+    IDENTITY_DIGITS (24); legacy 62-digit registry keys still parse.
     """
     if value and re.fullmatch(r"[0-9]+", value):
         team = int(value[-1]) & 1
@@ -153,7 +152,7 @@ def build_snapshot(slot: int, info: Dict[str, str], extra=None) -> str:
     """Render snapshot cfg lines the .func side execs back into cvars.
 
     ``info`` keys become _prof_userinfo_<key>; ``extra`` keys are used
-    verbatim (already full cvar names like _prof_id).
+    verbatim (already full cvar names like _prof_guid).
     """
     lines = ['set "_prof_userinfo_slot" "%d"' % slot]
     for key in sorted(info):
@@ -266,13 +265,13 @@ def handle_event(event: dict, cfg: Config) -> Optional[str]:
         return None
     identity, team, valid = split_identity(info.get("team_red_blue", ""))
     derived = {
-        "_prof_id_valid": "1" if valid else "0",
-        "_prof_id": identity,
+        "_prof_guid_valid": "1" if valid else "0",
+        "_prof_guid": identity,
         "_prof_team": str(team),
         # Fresh candidate for unregistered players; the .func offers it
         # once for `team_red_blue "<id><team>"`. Minted even for
         # garbage values (team digit resolved script-side).
-        "_prof_id_new": "" if valid else mint_identity(),
+        "_prof_guid_new": "" if valid else mint_identity(),
     }
     path = os.path.join(data_dir, "userinfo", "snapshot_%d.cfg" % slot)
     os.makedirs(os.path.dirname(path), exist_ok=True)
