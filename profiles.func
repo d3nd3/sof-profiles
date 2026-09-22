@@ -323,10 +323,9 @@ function fn_slot_info(~slot)
   set _prof_ps_present 0
   zero _sp_sv_info_client_ip
   sp_sv_info_client #~slot
-  sp_sc_flow_if text cvar _sp_sv_info_client_ip != val ""
+    sp_sc_flow_if text cvar _sp_sv_info_client_ip != val ""
   {
     set _prof_ps_present 1
-    sp_sc_cvar_copy _prof_ps_spec _sp_sv_info_client_spectator
   }
 }
 
@@ -815,56 +814,53 @@ function fn_enforce()
     sp_sc_func_exec fn_slot_info #~i
     sp_sc_flow_if number cvar _prof_ps_present == val 1
     {
-      sp_sc_flow_if text cvar _prof_ps_spec == val 0
+      sp_sc_func_exec fn_audit_slot #~i
+      sp_sc_flow_if text val #_prof_audit_rc == val ok
       {
-        sp_sc_func_exec fn_audit_slot #~i
-        sp_sc_flow_if text val #_prof_audit_rc == val ok
+        set _prof_is_registered_$~i 1
+        sset ~msg slot #~i ok guid #_prof_guid nickname #_prof_lookup_nickname
+        echo $~msg
+        add ~nok 1
+      }
+      else
+      {
+        sp_sc_flow_if text val #_prof_audit_rc == val wrong
         {
-          set _prof_is_registered_$~i 1
-          sset ~msg slot #~i ok guid #_prof_guid nickname #_prof_lookup_nickname
+          sset ~msg slot #~i wrong: #_prof_userinfo_team_red_blue remembered #_prof_remembered_guid_$~i
           echo $~msg
-          add ~nok 1
-        }
-        else
-        {
-          sp_sc_flow_if text val #_prof_audit_rc == val wrong
+          sp_sc_func_exec fn_restore_stash_push #~i
+          sp_sc_flow_if text val #_prof_push_rc == val pushed
           {
-            sset ~msg slot #~i wrong: #_prof_userinfo_team_red_blue remembered #_prof_remembered_guid_$~i
-            echo $~msg
-            sp_sc_func_exec fn_restore_stash_push #~i
-            sp_sc_flow_if text val #_prof_push_rc == val pushed
-            {
-              add ~nfix 1
-            }
-            else
-            {
-              sp_sc_flow_if text val #_prof_push_rc == val printed
-              {
-                add ~nmanual 1
-              }
-              else
-              {
-                sp_sc_func_exec fn_request_snapshot #~i
-                add ~npending 1
-              }
-            }
-            add ~nbad 1
+            add ~nfix 1
           }
           else
           {
-            sp_sc_flow_if text val #_prof_audit_rc == val guest
+            sp_sc_flow_if text val #_prof_push_rc == val printed
             {
-              sset ~msg slot #~i guest: #_prof_userinfo_team_red_blue
-              echo $~msg
-              add ~nguest 1
+              add ~nmanual 1
             }
             else
             {
-              sset ~msg slot #~i pending: no snapshot, requesting
-              echo $~msg
               sp_sc_func_exec fn_request_snapshot #~i
               add ~npending 1
             }
+          }
+          add ~nbad 1
+        }
+        else
+        {
+          sp_sc_flow_if text val #_prof_audit_rc == val guest
+          {
+            sset ~msg slot #~i guest: #_prof_userinfo_team_red_blue
+            echo $~msg
+            add ~nguest 1
+          }
+          else
+          {
+            sset ~msg slot #~i pending: no snapshot, requesting
+            echo $~msg
+            sp_sc_func_exec fn_request_snapshot #~i
+            add ~npending 1
           }
         }
       }

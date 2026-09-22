@@ -1,5 +1,12 @@
 # sof-profiles
 
+> **Deprecated** — This standalone project is no longer maintained. The same
+> functionality is implemented directly in
+> **[sof_buddy-server](https://github.com/d3nd3/sof_buddy-server)** as the native
+> `profiles` feature (`src/features/profiles/`). Use that repo instead; the
+> `.func` addons, Python services, and export-fire wiring described below are
+> obsolete when sof_buddy-server is built with profiles enabled.
+
 Admin-assigned player GUID for SoF1, carried in `team_red_blue`.
 
 ## Setup
@@ -166,7 +173,7 @@ Run in server console or rcon. All `prof_*` commands register on boot via
 
 ### `prof_enforce` — check all players and fix lost guids
 
-Walks every **connected, non-spectator** slot. For each one it reads the latest
+Walks every **connected** slot. For each one it reads the latest
 `snapshot_<slot>.cfg` (from `dumpuser`) and compares `team_red_blue` to the admin
 registry.
 
